@@ -7,6 +7,10 @@ Default pattern:
   step n uses ON=n*0.200 s, then OFF=n*0.200 s
   total pattern time = 18.000 s
 
+The frequency range, rung count and total time are selectable with
+--start-ghz/--stop-ghz/--steps/--total-s. The defaults above are pinned and
+unchanged: they are the pattern the accompanying guide PDF documents.
+
 IMPORTANT:
   - This is intended only for a closed, shielded or otherwise controlled RF
     test path. 10.7-12.7 GHz overlaps satellite downlink allocations in many
@@ -40,6 +44,18 @@ MAX_PFD_HZ = 75_000_000
 MIN_OUTB_HZ = 6_800_000_000
 MAX_OUTB_HZ = 13_600_000_000
 MIN_INT_PRESCALER_89 = 75
+
+# Pinned defaults: the pattern documented in the guide PDF. Changing any of
+# these changes what the guide describes, so they are named rather than typed
+# twice (make_ladder signature and argparse both use them).
+DEFAULT_START_HZ = 10_700_000_000
+DEFAULT_STOP_HZ = 12_700_000_000
+DEFAULT_STEPS = 9
+DEFAULT_TOTAL_S = 18.0
+
+# Satellite downlink allocations that the default range sits inside.
+SATBAND_LO_HZ = 10_700_000_000
+SATBAND_HI_HZ = 12_700_000_000
 
 REG5_DEFAULT = 0x00800025
 REG6_DEFAULT = 0x14000006
@@ -508,10 +524,10 @@ class ADF5355:
 
 
 def make_ladder(
-    start_hz: int = 10_700_000_000,
-    stop_hz: int = 12_700_000_000,
-    steps: int = 9,
-    total_s: float = 18.0,
+    start_hz: int = DEFAULT_START_HZ,
+    stop_hz: int = DEFAULT_STOP_HZ,
+    steps: int = DEFAULT_STEPS,
+    total_s: float = DEFAULT_TOTAL_S,
 ) -> List[LadderStep]:
     if steps < 2:
         raise ValueError("Need at least 2 ladder steps")
@@ -545,6 +561,67 @@ def make_ladder(
     return result
 
 
+def ghz_to_hz(ghz: float) -> int:
+    """GHz from the command line to integer Hz, rounded like --ref-mhz is."""
+    if not math.isfinite(ghz):
+        raise ValueError(f"{ghz} GHz is not a finite frequency")
+    return round(ghz * 1_000_000_000)
+
+
+def validate_ladder_range(start_hz: int, stop_hz: int, steps: int) -> None:
+    """Check a requested range before any hardware is touched.
+
+    _build_frequency_registers enforces the RFOUTB limits one frequency at a
+    time, which is too late to be useful: the early rungs would already have
+    been keyed on before an out-of-band rung was reached.
+    """
+    for option, hz in (("--start-ghz", start_hz), ("--stop-ghz", stop_hz)):
+        if not (MIN_OUTB_HZ <= hz <= MAX_OUTB_HZ):
+            raise ValueError(
+                f"{option} {hz/1e9:.6f} GHz is outside the ADF5355 RFOUTB "
+                f"range {MIN_OUTB_HZ/1e9:.1f}-{MAX_OUTB_HZ/1e9:.1f} GHz"
+            )
+    if stop_hz < start_hz:
+        raise ValueError(
+            f"--stop-ghz {stop_hz/1e9:.6f} GHz is below --start-ghz "
+            f"{start_hz/1e9:.6f} GHz; the ladder only climbs"
+        )
+    if steps < 2:
+        # A zero-span range is legal - the rungs are then told apart by their
+        # duration coding alone - but that still needs at least two of them.
+        if start_hz == stop_hz:
+            raise ValueError(
+                "--start-ghz equals --stop-ghz, so the rungs differ only in "
+                f"duration; that needs --steps 2 or more, not {steps}"
+            )
+        raise ValueError(
+            f"--steps {steps} is too few; a ladder needs at least 2 rungs, "
+            "one at --start-ghz and one at --stop-ghz"
+        )
+
+
+def safety_notice(start_hz: int, stop_hz: int) -> List[str]:
+    """Bench-only warning lines. Only the satellite text depends on the range."""
+    lines = [
+        "SAFETY: closed/shielded/attenuated bench test only; do not radiate this sweep.",
+        "RFOUTA+/- are disabled; RFOUTB/OB is the only RF output used.",
+    ]
+    band = f"{SATBAND_LO_HZ/1e9:.1f}-{SATBAND_HI_HZ/1e9:.1f} GHz"
+    swept = f"{start_hz/1e9:.3f}-{stop_hz/1e9:.3f} GHz"
+    if start_hz <= SATBAND_HI_HZ and stop_hz >= SATBAND_LO_HZ:
+        lines.append(
+            f"SAFETY: {swept} overlaps the {band} satellite downlink band. "
+            "Do not connect an antenna."
+        )
+    else:
+        lines.append(
+            f"SAFETY: {swept} is outside the {band} satellite downlink band, "
+            "but this is bench-only equipment either way: keep the OB path "
+            "shielded and attenuated, and do not connect an antenna."
+        )
+    return lines
+
+
 def print_ladder(steps: List[LadderStep]) -> None:
     print("\nDuration-coded RFOUTB ladder")
     print("step  RF GHz     ON s   OFF s   timeline s")
@@ -554,6 +631,19 @@ def print_ladder(steps: List[LadderStep]) -> None:
             f"{s.index:>4}  {s.freq_hz/1e9:8.3f}  {s.on_s:5.3f}  {s.off_s:6.3f}  "
             f"{s.start_s:5.1f}-{s.end_s:5.1f}"
         )
+    # Everything below is derived from the requested range and timing budget.
+    span_hz = steps[-1].freq_hz - steps[0].freq_hz
+    spacing_hz = span_hz / (len(steps) - 1) if len(steps) > 1 else 0.0
+    # Rung n is ON=n*u and OFF=n*u, so rung 1's ON time is the unit time itself.
+    unit_s = steps[0].on_s
+    print(
+        f"Range: {steps[0].freq_hz/1e9:.6f}-{steps[-1].freq_hz/1e9:.6f} GHz "
+        f"in {len(steps)} bins, spacing {spacing_hz/1e6:.6f} MHz"
+    )
+    print(
+        f"Unit time u = {unit_s:.6f} s; rung n is ON=n*u then OFF=n*u "
+        f"({steps[0].on_s:.3f} s to {steps[-1].on_s:.3f} s per phase)"
+    )
     print(f"Total coded interval: {steps[-1].end_s:.3f} s\n")
 
 
@@ -609,7 +699,10 @@ def run_ladder(synth: ADF5355, steps: List[LadderStep], loops: int) -> None:
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="ADF5355 10.7-12.7 GHz duration-coded ladder (RFOUTB, bench test only)"
+        description=(
+            "ADF5355 duration-coded frequency ladder (RFOUTB, bench test only); "
+            f"defaults to {DEFAULT_START_HZ/1e9:.1f}-{DEFAULT_STOP_HZ/1e9:.1f} GHz"
+        )
     )
     p.add_argument(
         "--ref-mhz",
@@ -621,8 +714,30 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--bus", type=int, default=0, help="SPI bus (default 0)")
     p.add_argument("--device", type=int, default=0, help="SPI device/CE (default 0 = CE0)")
     p.add_argument("--spi-hz", type=int, default=1_000_000, help="SPI clock rate (default 1 MHz)")
-    p.add_argument("--steps", type=int, default=9, help="Number of ladder rungs (default 9)")
-    p.add_argument("--total-s", type=float, default=18.0, help="Total coded interval (default 18.0 s)")
+    p.add_argument(
+        "--start-ghz",
+        type=float,
+        default=DEFAULT_START_HZ / 1e9,
+        help=f"First ladder frequency in GHz (default {DEFAULT_START_HZ/1e9:.1f})",
+    )
+    p.add_argument(
+        "--stop-ghz",
+        type=float,
+        default=DEFAULT_STOP_HZ / 1e9,
+        help=f"Last ladder frequency in GHz (default {DEFAULT_STOP_HZ/1e9:.1f})",
+    )
+    p.add_argument(
+        "--steps",
+        type=int,
+        default=DEFAULT_STEPS,
+        help=f"Number of ladder rungs (default {DEFAULT_STEPS})",
+    )
+    p.add_argument(
+        "--total-s",
+        type=float,
+        default=DEFAULT_TOTAL_S,
+        help=f"Total coded interval (default {DEFAULT_TOTAL_S} s)",
+    )
     p.add_argument("--loops", type=int, default=1, help="Number of complete ladders (default 1; max 100)")
     p.add_argument(
         "--dry-run",
@@ -644,11 +759,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     ref_hz = round(args.ref_mhz * 1_000_000)
-    steps = make_ladder(steps=args.steps, total_s=args.total_s)
+    try:
+        start_hz = ghz_to_hz(args.start_ghz)
+        stop_hz = ghz_to_hz(args.stop_ghz)
+        validate_ladder_range(start_hz, stop_hz, args.steps)
+        steps = make_ladder(
+            start_hz=start_hz,
+            stop_hz=stop_hz,
+            steps=args.steps,
+            total_s=args.total_s,
+        )
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
     print_ladder(steps)
 
-    print("SAFETY: closed/shielded/attenuated bench test only; do not radiate this sweep.")
-    print("RFOUTA+/- are disabled; RFOUTB/OB is the only RF output used.")
+    for line in safety_notice(start_hz, stop_hz):
+        print(line)
 
     synth = ADF5355(
         ref_hz=ref_hz,

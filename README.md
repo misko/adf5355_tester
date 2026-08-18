@@ -92,7 +92,7 @@ the residual is real rather than a float artifact.
 python3 -m unittest discover -s tests -t .
 ```
 
-41 tests, no hardware required. The register images are checked three ways:
+64 tests, no hardware required. The register images are checked three ways:
 
 1. **`tests/test_registers.py`** — the bitfield table itself: no field overlaps
    another, collides with reserved bits, or corrupts the address nibble.
@@ -130,5 +130,29 @@ bugs. Each is corrected here and marked `DIVERGENCE` in `plan.py`.
 
 ## Safety
 
-`adf5355_ladder.py` sweeps 10.7–12.7 GHz, which overlaps satellite downlink
-allocations. Use a closed, shielded, attenuated path. Do not radiate.
+`adf5355_ladder.py` defaults to a 9-rung 10.7–12.7 GHz ladder, which overlaps
+satellite downlink allocations. Use a closed, shielded, attenuated path. Do not
+radiate. RF is never enabled without `--enable-rf`; `--dry-run` computes the
+schedule and the first register image and touches no hardware.
+
+The range is selectable, but the defaults are pinned to the pattern documented
+in `raspberry_pi_adf5355_ku_ladder_guide.pdf`, so a run with no range arguments
+is byte-for-byte the same ladder as before.
+
+```bash
+python3 adf5355_ladder.py --ref-mhz 40 --dry-run
+python3 adf5355_ladder.py --ref-mhz 40 --start-ghz 8.0 --stop-ghz 9.0 \
+                          --steps 5 --total-s 6 --dry-run
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--start-ghz` | 10.7 | First rung in GHz; must sit inside RFOUTB's 6.8–13.6 GHz |
+| `--stop-ghz` | 12.7 | Last rung in GHz; must be in band and not below `--start-ghz` |
+| `--steps` | 9 | Number of rungs (2 or more); spacing is span/(steps−1) |
+| `--total-s` | 18.0 | Coded interval; rung n is ON=n·u then OFF=n·u, u = total/(N(N+1)) |
+
+The whole range is checked before anything is programmed, so an out-of-band,
+inverted or degenerate request fails with a message and exit status 2 instead of
+partway through a live sweep. The printed summary reports what was derived from
+the range: bin count, spacing, the unit time u and the total coded interval.

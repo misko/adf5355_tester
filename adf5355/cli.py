@@ -1,0 +1,282 @@
+"""Command line front end.
+
+    python3 -m adf5355 dump  --ref-mhz 10 --freq 2.4G
+    python3 -m adf5355 set   --ref-mhz 10 --freq 11.7G --channel B --enable-rf
+    python3 -m adf5355 sweep --ref-mhz 10 --start 1G --stop 6G --points 51
+    python3 -m adf5355 off   --ref-mhz 10
+
+RF is never enabled without --enable-rf.
+"""
+from __future__ import annotations
+
+import argparse
+import signal
+import sys
+import time
+
+from .device import (DEFAULT_CE_GPIO, DEFAULT_MUXOUT_GPIO, DEFAULT_SPI_HZ,
+                     ADF5355, LockTimeout)
+from .plan import Channel, SynthConfig, plan
+from .registers import MuxOut, OutputPower
+
+_SUFFIXES = {"k": 1e3, "m": 1e6, "g": 1e9}
+
+
+def parse_frequency(text: str) -> int:
+    """Accept 2400000000, 2.4e9, 2400M, 11.7G, 53.125k."""
+    text = text.strip().replace("_", "").replace("hz", "").replace("Hz", "")
+    multiplier = 1.0
+    if text and text[-1].lower() in _SUFFIXES:
+        multiplier = _SUFFIXES[text[-1].lower()]
+        text = text[:-1]
+    try:
+        return round(float(text) * multiplier)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"cannot parse frequency {text!r}")
+
+
+def build_config(args, outa: bool, outb: bool) -> SynthConfig:
+    return SynthConfig(
+        ref_hz=round(args.ref_mhz * 1e6),
+        ref_doubler=args.ref_doubler,
+        ref_div2=args.ref_div2,
+        ref_diff=args.ref_diff,
+        r_counter=args.r_counter,
+        cp_ua=args.cp_ua,
+        muxout=MuxOut.DIGITAL_LOCK_DETECT,
+        muxout_3v3=True,
+        outa_enable=outa,
+        outa_power=OutputPower(args.power),
+        outb_enable=outb,
+        mute_till_lock=not args.no_mute_till_lock,
+        negative_bleed=not args.no_negative_bleed,
+        solver=args.solver,
+    )
+
+
+def open_device(args, config: SynthConfig) -> ADF5355:
+    return ADF5355(
+        config, bus=args.bus, device=args.device, spi_hz=args.spi_hz,
+        ce_gpio=None if args.ce_gpio < 0 else args.ce_gpio,
+        muxout_gpio=None if args.muxout_gpio < 0 else args.muxout_gpio,
+        dry_run=args.dry_run,
+    ).open()
+
+
+def report_lock(dev: ADF5355, args) -> bool:
+    if not dev.can_detect_lock:
+        dev.settle()
+        print("  lock UNVERIFIED (MUXOUT not wired -- open loop)")
+        return True
+    if args.no_lock_check:
+        return True
+    try:
+        waited = dev.wait_for_lock(args.lock_timeout)
+    except LockTimeout as exc:
+        print(f"  LOCK FAILED: {exc}", file=sys.stderr)
+        return False
+    print(f"  locked in {waited * 1e3:.1f} ms")
+    return True
+
+
+def cmd_dump(args) -> int:
+    channel = Channel(args.channel)
+    config = build_config(args, channel is Channel.A, channel is Channel.B)
+    p = plan(config, args.freq, channel)
+    print(p.summary())
+    print()
+    print(p.registers.dump())
+    print()
+    print("Cold-start write order (R0 last, carrying autocal):")
+    dev = ADF5355(config, dry_run=True)
+    dev.program(p)
+    print("  " + "\n  ".join(str(r) for r in dev.trace))
+    return 0
+
+
+def cmd_set(args) -> int:
+    channel = Channel(args.channel)
+    enable = args.enable_rf
+    config = build_config(args, enable and channel is Channel.A,
+                          enable and channel is Channel.B)
+    p = plan(config, args.freq, channel)
+    print(p.summary())
+    if not enable and not args.dry_run:
+        print("\nRF stays disabled; re-run with --enable-rf into a "
+              "shielded/attenuated path.")
+
+    dev = open_device(args, config)
+    try:
+        dev.program(p)
+        print(f"\nprogrammed RFout{channel.value} "
+              f"{float(p.solution.achieved_hz)/1e9:.9f} GHz")
+        ok = report_lock(dev, args)
+        if args.hold:
+            print(f"holding for {args.hold:.3f} s (Ctrl-C to stop)")
+            time.sleep(args.hold)
+        else:
+            return 0 if ok else 1
+    finally:
+        if args.hold or not args.enable_rf:
+            dev.close()
+    return 0
+
+
+def cmd_sweep(args) -> int:
+    channel = Channel(args.channel)
+    config = build_config(args, args.enable_rf and channel is Channel.A,
+                          args.enable_rf and channel is Channel.B)
+    if args.points < 2:
+        print("--points must be at least 2", file=sys.stderr)
+        return 2
+    step = (args.stop - args.start) / (args.points - 1)
+    freqs = [round(args.start + step * i) for i in range(args.points)]
+
+    dev = open_device(args, config)
+    failures = 0
+    try:
+        for i, freq in enumerate(freqs):
+            p = dev.set_frequency(freq, channel)
+            s = p.solution
+            marker = "  <- divider change" if i and \
+                s.rf_divider_select != prev_div else ""
+            prev_div = s.rf_divider_select
+            print(f"{i + 1:>4}/{len(freqs)}  {freq / 1e9:12.6f} GHz  "
+                  f"/{1 << s.rf_divider_select:<2}  "
+                  f"err {float(s.error_hz):+9.3f} Hz{marker}")
+            if not report_lock(dev, args):
+                failures += 1
+            time.sleep(args.dwell)
+    finally:
+        dev.close()
+    if failures:
+        print(f"\n{failures}/{len(freqs)} points failed to lock", file=sys.stderr)
+        return 1
+    print(f"\nall {len(freqs)} points locked")
+    return 0
+
+
+def cmd_off(args) -> int:
+    config = build_config(args, False, False)
+    dev = open_device(args, config)
+    try:
+        dev.program(plan(config, args.freq, Channel(args.channel)))
+        dev.mute()
+        print("outputs disabled")
+    finally:
+        dev.close()
+    return 0
+
+
+def cmd_probe(args) -> int:
+    if args.muxout_gpio < 0:
+        print("probe needs MUXOUT wired to a GPIO; pass --muxout-gpio N",
+              file=sys.stderr)
+        return 2
+    config = build_config(args, False, False)
+    dev = open_device(args, config)
+    try:
+        result = dev.probe()
+    finally:
+        dev.close()
+    print(f"MUXOUT commanded high -> read {int(bool(result['high']))}")
+    print(f"MUXOUT commanded low  -> read {int(bool(result['low']))}")
+    if result["ok"]:
+        print("PASS: the ADF5355 is receiving and acting on SPI writes")
+        return 0
+    print("FAIL: check CE is high, LE/CLK/DAT wiring, and board power",
+          file=sys.stderr)
+    return 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="adf5355", description="ADF5355 synthesizer control")
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--ref-mhz", type=float, required=True,
+                        help="actual REFIN frequency on your board, in MHz "
+                             "(required -- clone boards differ; do not guess)")
+    common.add_argument("--ref-doubler", action="store_true")
+    common.add_argument("--ref-div2", action="store_true")
+    common.add_argument("--ref-diff", action="store_true",
+                        help="differential REFIN input")
+    common.add_argument("--r-counter", type=int, default=None,
+                        help="force the R divider instead of maximizing f_PFD")
+    common.add_argument("--cp-ua", type=int, default=900,
+                        help="charge pump current, 315-5040 uA (default 900)")
+    common.add_argument("--power", type=int, default=3, choices=[0, 1, 2, 3],
+                        help="RFoutA power: 0=-4 1=-1 2=+2 3=+5 dBm")
+    common.add_argument("--channel", default="A", choices=["A", "B"],
+                        help="A = VCO/2**d (53.125 MHz-6.8 GHz), "
+                             "B = doubler (6.8-13.6 GHz)")
+    common.add_argument("--solver", default="adi", choices=["adi", "exact"])
+    common.add_argument("--no-mute-till-lock", action="store_true")
+    common.add_argument("--no-negative-bleed", action="store_true")
+    common.add_argument("--bus", type=int, default=0)
+    common.add_argument("--device", type=int, default=0,
+                        help="SPI chip select driving LE (0 = CE0)")
+    common.add_argument("--spi-hz", type=int, default=DEFAULT_SPI_HZ)
+    common.add_argument("--ce-gpio", type=int, default=DEFAULT_CE_GPIO,
+                        help="BCM pin driving CE; -1 if CE is strapped high")
+    common.add_argument("--muxout-gpio", type=int, default=DEFAULT_MUXOUT_GPIO,
+                        help=f"BCM pin reading MUXOUT (default "
+                             f"{DEFAULT_MUXOUT_GPIO} = header pin 35); "
+                             f"-1 if not wired, which leaves no lock detect "
+                             f"and no way to confirm a write landed")
+    common.add_argument("--lock-timeout", type=float, default=0.5)
+    common.add_argument("--no-lock-check", action="store_true")
+    common.add_argument("--dry-run", action="store_true",
+                        help="compute everything, touch no hardware")
+    common.add_argument("--enable-rf", action="store_true",
+                        help="required before any output is enabled")
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    pr = sub.add_parser("probe", parents=[common],
+                        help="prove the chip receives writes, via MUXOUT")
+    pr.set_defaults(func=cmd_probe)
+
+    d = sub.add_parser("dump", parents=[common],
+                       help="print the register image and write order")
+    d.add_argument("--freq", type=parse_frequency, required=True)
+    d.set_defaults(func=cmd_dump)
+
+    s = sub.add_parser("set", parents=[common], help="program one frequency")
+    s.add_argument("--freq", type=parse_frequency, required=True)
+    s.add_argument("--hold", type=float, default=0.0,
+                   help="seconds to hold the output before muting")
+    s.set_defaults(func=cmd_set)
+
+    w = sub.add_parser("sweep", parents=[common],
+                       help="step across a range, checking lock at each point")
+    w.add_argument("--start", type=parse_frequency, required=True)
+    w.add_argument("--stop", type=parse_frequency, required=True)
+    w.add_argument("--points", type=int, default=51)
+    w.add_argument("--dwell", type=float, default=0.02)
+    w.set_defaults(func=cmd_sweep)
+
+    o = sub.add_parser("off", parents=[common], help="disable both outputs")
+    o.add_argument("--freq", type=parse_frequency, default=2_400_000_000)
+    o.set_defaults(func=cmd_off)
+    return parser
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+
+    def on_signal(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, on_signal)
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        print("\ninterrupted; outputs muted", file=sys.stderr)
+        return 130
+    except (ValueError, LockTimeout) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

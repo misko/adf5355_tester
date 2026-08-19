@@ -1857,6 +1857,15 @@ def capture_single_shot(path: Path, *, uri: str, if_hz: float, fs: float,
     sdr.rx_destroy_buffer()
     sdr._rxadc.set_kernel_buffers_count(1)
 
+    # The buffer takes `seconds` of real time to fill, and libiio's default
+    # context timeout is far shorter than a long slow capture. Without this a
+    # capture that is merely long -- 8 s at 1 MS/s -- fails as a TimeoutError
+    # on refill, which reads exactly like a wedged radio and is not one.
+    try:
+        sdr._ctx.set_timeout(int(seconds * 2000) + 30_000)
+    except Exception:                                      # noqa: BLE001
+        pass
+
     want = int(seconds * fs)
     if want > MAX_SINGLE_SHOT_SAMPLES:
         raise ValueError(

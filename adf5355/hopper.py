@@ -43,6 +43,7 @@ plan, ``min_hop`` and the hop count; nothing else is transmitted.
 """
 from __future__ import annotations
 
+import gc
 import time
 from dataclasses import dataclass
 
@@ -219,14 +220,33 @@ def run_hops(dev, hops: list[Hop], channel, settle_s: float = 0.05) -> None:
     # then hop without it. Re-running the band search on every hop would blank
     # the output through mute-till-lock for a large part of each dwell, which
     # at 5 ms leaves almost nothing radiated.
+    # Solve every point once. Rebuilding a Plan per hop costs about 139 us and
+    # would itself set the maximum hop rate well below what the part can do.
+    order = sorted({h.freq_hz for h in hops})
+    cached = dict(zip(order, dev.precompute(order, channel)))
+
     dev.set_frequency(hops[0].freq_hz, channel)
     if settle_s:
         time.sleep(settle_s)
-    dev.set_output(channel, True)
-    t0 = time.monotonic()
-    for index, hop in enumerate(hops):
-        _sleep_until(t0 + hop.end_s)
-        nxt = hops[index + 1] if index + 1 < len(hops) else None
-        if nxt is not None:
-            dev.set_frequency(nxt.freq_hz, channel, autocal=False)
-    dev.set_output(channel, False)
+
+    # A collection pause is the one thing that can miss a hop deadline. Median
+    # jitter is under a microsecond, but a pause measured 22.8 ms -- 36 dwells
+    # at 1600 hops/s -- and put 43 of 4800 hops late by over half a dwell. The
+    # emitted pattern then stops matching the schedule the receiver assumes, and
+    # because pauses are stochastic the failure moves between runs, which is
+    # what made marginal hop rates look flaky rather than simply broken.
+    # Disabled here, max jitter is 3.6 us and nothing is late.
+    collecting = gc.isenabled()
+    gc.disable()
+    try:
+        dev.set_output(channel, True)
+        t0 = time.monotonic()
+        for index, hop in enumerate(hops):
+            _sleep_until(t0 + hop.end_s)
+            nxt = hops[index + 1] if index + 1 < len(hops) else None
+            if nxt is not None:
+                dev.apply_precomputed(cached[nxt.freq_hz])
+        dev.set_output(channel, False)
+    finally:
+        if collecting:
+            gc.enable()

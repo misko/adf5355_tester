@@ -228,6 +228,19 @@ class FakeDevice:
     def set_frequency(self, freq_hz, channel, autocal=True):
         self.calls.append((self._at(), "freq", freq_hz, autocal))
 
+    # run_hops solves every point once up front and then writes cached words,
+    # so the fake models that split rather than a set_frequency per hop.
+    def precompute(self, freqs, channel):
+        self.precomputed = list(freqs)
+        return [("words", int(f)) for f in freqs]
+
+    def apply_precomputed(self, triple):
+        kind, freq_hz = triple
+        assert kind == "words", "apply_precomputed got something else"
+        # A cached write never runs the band search; record it as autocal=False
+        # so the existing assertions keep their meaning.
+        self.calls.append((self._at(), "freq", freq_hz, False))
+
     def set_output(self, channel, on):
         if on and self.origin is None:
             self.origin = time.monotonic()
@@ -284,3 +297,78 @@ class TestRunHops(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGcIsHeldOffDuringTheLoop(unittest.TestCase):
+    """A collection pause is the only thing that misses a hop deadline.
+
+    Measured at 1600 hops/s: median jitter under a microsecond, but a pause of
+    22.8 ms -- 36 dwells -- putting 43 of 4800 hops late by over half a dwell.
+    Because pauses are stochastic the resulting failures move between runs,
+    which is what made marginal hop rates look flaky rather than broken.
+    """
+
+    def test_collection_is_disabled_while_hopping_and_restored_after(self):
+        import gc
+        from adf5355.hopper import run_hops
+
+        seen = []
+
+        class Watcher(FakeDevice):
+            def apply_precomputed(self, triple):
+                seen.append(gc.isenabled())
+                super().apply_precomputed(triple)
+
+        freqs = plan_frequencies(11_000_000_000, 11_000_060_000, 4)
+        hops = make_schedule(0xC0FFEE, freqs, 0.001, 1)
+        self.assertTrue(gc.isenabled(), "precondition: gc on")
+        run_hops(Watcher(), hops, channel=None, settle_s=0.0)
+        self.assertTrue(seen, "no hops were applied")
+        self.assertFalse(any(seen), "gc ran during the timed loop")
+        self.assertTrue(gc.isenabled(), "gc was not restored")
+
+    def test_gc_state_is_restored_even_if_the_loop_raises(self):
+        import gc
+        from adf5355.hopper import run_hops
+
+        class Exploding(FakeDevice):
+            def apply_precomputed(self, triple):
+                raise RuntimeError("boom")
+
+        freqs = plan_frequencies(11_000_000_000, 11_000_060_000, 4)
+        hops = make_schedule(0xC0FFEE, freqs, 0.001, 1)
+        with self.assertRaises(RuntimeError):
+            run_hops(Exploding(), hops, channel=None, settle_s=0.0)
+        self.assertTrue(gc.isenabled(), "gc left disabled after a failure")
+
+
+class TestTraceStaysBounded(unittest.TestCase):
+    """The write trace must not grow without bound during a long transmission.
+
+    Three writes per hop at 1600 hops/s is about 17 million records an hour --
+    roughly 2.3 GB -- which would exhaust the machine mid-run. The trace exists
+    to show what just happened, so it keeps a window.
+    """
+
+    def test_a_long_run_does_not_grow_the_trace_without_limit(self):
+        from adf5355 import Channel, SynthConfig
+        from adf5355.device import TRACE_LIMIT, ADF5355
+
+        cfg = SynthConfig(ref_hz=125_000_000, outb_enable=True)
+        dev = ADF5355(cfg, dry_run=True)
+        dev.set_frequency(11_000_000_000, Channel.B)
+        cached = dev.precompute([11_000_000_000, 11_000_090_000], Channel.B)
+        for i in range(TRACE_LIMIT * 3):
+            dev.apply_precomputed(cached[i % 2])
+        self.assertLessEqual(len(dev.trace), TRACE_LIMIT)
+
+    def test_the_most_recent_writes_are_the_ones_kept(self):
+        from adf5355 import Channel, SynthConfig
+        from adf5355.device import TRACE_LIMIT, ADF5355
+
+        cfg = SynthConfig(ref_hz=125_000_000, outb_enable=True)
+        dev = ADF5355(cfg, dry_run=True)
+        for i in range(TRACE_LIMIT + 50):
+            dev._write(6, 0x35004836 | (i & 1))
+        self.assertEqual(len(dev.trace), TRACE_LIMIT)
+        self.assertEqual(dev.trace[-1].word & 1, (TRACE_LIMIT + 49) & 1)

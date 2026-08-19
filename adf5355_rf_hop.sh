@@ -97,4 +97,5 @@ exec "$ADF" hop \
     --cycles        "$CYCLES" \
     --channel       "$CHANNEL" \
     --power         "$POWER" \
+    --spi-hz        "$SPI_HZ" \
     --enable-rf

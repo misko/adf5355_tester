@@ -2,6 +2,20 @@
 
 Control an ADF5355 wideband synthesizer (54 MHz – 13.6 GHz) from a Raspberry Pi.
 
+> ## ⚠️ Closed RF paths only — never radiate
+>
+> Everything in this repository is a **bench procedure into a closed, shielded,
+> attenuated path**. The ladder and the calibration described below are
+> theoretical exercises for conducted test setups only.
+>
+> **Never connect an antenna. Never transmit any of this over the air.**
+>
+> The default ladder occupies 10.7–12.7 GHz, which is *satellite downlink*
+> spectrum. Terrestrial transmission there is prohibited in essentially every
+> jurisdiction, and even a few milliwatts near a dish or LNB can wipe out
+> reception well beyond your own bench. Keep the synthesiser output conducted:
+> coax into a load, an attenuator, or a shielded enclosure.
+
 Provides a single `adf5355` command for bring-up, register inspection, single-tone
 transmission, band sweeps with lock verification, and a duration-coded frequency
 ladder that a downstream receiver can use to measure its own clock error.
@@ -225,6 +239,15 @@ true to the schedule.
 ---
 
 ## Running a calibration end to end
+
+> **Conducted path only.** This example is written for a closed bench setup: the
+> synthesiser reaches the LNB through coax and attenuation, inside shielding.
+> Do not radiate it, and do not put an antenna on either end. The frequencies
+> involved are satellite downlink allocations.
+>
+> Note also that an LNB front end expects roughly −100 dBm. Feeding one directly
+> from the synthesiser without heavy attenuation will saturate it and can damage
+> it, quite apart from the licensing question.
 
 A complete worked example against a PlutoSDR behind a 13 V (low band) universal
 LNB, whose nominal LO is 9.750 GHz.
@@ -482,9 +505,20 @@ bugs. Each is corrected here and marked `DIVERGENCE` in `plan.py`.
 
 ## Safety
 
+**These are theoretical bench tests and must never be performed over open air.**
+
 The default ladder sweeps 10.7–12.7 GHz, which overlaps satellite downlink
-allocations. Use a closed, shielded, attenuated path. **Do not connect an
-antenna and radiate it.**
+allocations. Transmitting there terrestrially is prohibited in essentially every
+jurisdiction, requires a licence you almost certainly do not hold, and can
+interfere with satellite reception far outside your own site.
+
+Every procedure in this repository assumes a **closed, conducted path**: coax
+from the synthesiser into an attenuator and a load, or into a shielded
+enclosure. **Do not connect an antenna. Do not radiate.** If you cannot
+guarantee the path is closed, do not pass `--enable-rf`.
+
+`dump`, `probe` and any `--dry-run` invocation never key the output, so the
+register work and the arithmetic can all be exercised with no RF at all.
 
 `--power` defaults to the lowest step, but +5 dBm is available and will damage a
 PlutoSDR front end (limit around +2.5 dBm). Pad the path 20–30 dB before

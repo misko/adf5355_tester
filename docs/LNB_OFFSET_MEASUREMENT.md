@@ -1,5 +1,9 @@
 # Measuring a PlutoSDR's clock error through an LNB
 
+> **⚠️ Closed, conducted path only.** This is a bench measurement. The
+> frequencies used are satellite downlink allocations and must never be
+> radiated. Do not connect an antenna to either end.
+
 Result of running the ADF5355 ladder into a 13 V (low band, vertical) universal
 LNB feeding a PlutoSDR on RX0.
 

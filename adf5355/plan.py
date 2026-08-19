@@ -134,7 +134,7 @@ class SynthConfig:
     muxout: MuxOut = MuxOut.DIGITAL_LOCK_DETECT
     muxout_3v3: bool = True               # Pi GPIO wants 3.3 V, not 1.8 V
     outa_enable: bool = False
-    outa_power: OutputPower = OutputPower.PLUS_5_DBM
+    outa_power: OutputPower = OutputPower.MINUS_4_DBM
     outb_enable: bool = False
     mute_till_lock: bool = True
     negative_bleed: bool = True

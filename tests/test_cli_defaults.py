@@ -86,3 +86,24 @@ class TestRfGate(unittest.TestCase):
         args = cli.build_parser().parse_args(["dwell", "--freq", "2.4G"])
         self.assertEqual(args.dwell, 10.0)
         self.assertFalse(args.enable_rf)
+
+
+class TestPowerDefault(unittest.TestCase):
+    def test_cli_defaults_to_the_lowest_power_step(self):
+        args = cli.build_parser().parse_args(["dwell", "--freq", "2.4G"])
+        self.assertEqual(args.power, 0)
+        self.assertEqual(cli.DEFAULT_POWER, 0)
+
+    def test_library_default_matches_the_cli_default(self):
+        from adf5355 import OutputPower, SynthConfig
+        self.assertEqual(SynthConfig(ref_hz=125_000_000).outa_power,
+                         OutputPower.MINUS_4_DBM)
+        self.assertEqual(int(OutputPower.MINUS_4_DBM), cli.DEFAULT_POWER)
+
+    def test_power_is_still_settable_to_maximum(self):
+        from adf5355 import Channel, plan
+        args = cli.build_parser().parse_args(
+            ["dump", "--freq", "2.4G", "--enable-rf", "--power", "3"])
+        cfg = cli.build_config(args, True, False)
+        regs = plan(cfg, args.freq, Channel.A).registers
+        self.assertEqual(regs.get("output_power"), 3)

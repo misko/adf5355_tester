@@ -26,6 +26,10 @@ from .registers import MuxOut, OutputPower
 # X1 on this board is marked R125.000.  Overridable, never guessed.
 DEFAULT_REF_MHZ = 125.0
 
+# Lowest of the four RFoutA steps (-4 dBm).  Least likely to damage
+# whatever is on the other end of the cable; raise it deliberately.
+DEFAULT_POWER = 0
+
 # Ku-band satellite downlink; the ladder script carries the same warning.
 SATBAND_LO_HZ = 10_700_000_000
 SATBAND_HI_HZ = 12_700_000_000
@@ -264,8 +268,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="force the R divider instead of maximizing f_PFD")
     common.add_argument("--cp-ua", type=int, default=900,
                         help="charge pump current, 315-5040 uA (default 900)")
-    common.add_argument("--power", type=int, default=3, choices=[0, 1, 2, 3],
-                        help="RFoutA power: 0=-4 1=-1 2=+2 3=+5 dBm")
+    common.add_argument("--power", type=int, default=DEFAULT_POWER,
+                        choices=[0, 1, 2, 3],
+                        help=f"RFoutA power: 0=-4 1=-1 2=+2 3=+5 dBm "
+                             f"(default {DEFAULT_POWER}, the lowest setting)")
     common.add_argument("--channel", default="A", choices=["A", "B"],
                         help="A = VCO/2**d (53.125 MHz-6.8 GHz), "
                              "B = doubler (6.8-13.6 GHz)")

@@ -61,6 +61,15 @@ the assumed reference, so the VCO lands somewhere else entirely and only the
 points that happen to fall back inside 3.4-6.8 GHz will lock. If you see
 scattered `LOCK FAILED` lines with no frequency pattern, check this first.
 
+### Output power
+
+`--power` selects one of the four RFoutA steps: `0` = -4 dBm (the default),
+`1` = -1, `2` = +2, `3` = +5 dBm. It defaults to the lowest step so that
+forgetting the flag cannot damage whatever is on the other end of the cable;
+raise it deliberately. There is no finer control on this part -- use an
+external attenuator. RFoutB has enable only, no power setting, so `--power`
+does nothing on `--channel B`.
+
 ### Transmitting a single tone
 
 ```bash

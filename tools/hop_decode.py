@@ -1762,7 +1762,8 @@ def write_int16(path, samples: np.ndarray, scale: float = 2000.0) -> int:
 # ---------------------------------------------------------------------------
 def capture_from_pluto(path: Path, *, uri: str, if_hz: float, fs: float,
                        seconds: float, gain: float,
-                       nbuf: int = DEFAULT_NBUF) -> tuple[int, float]:
+                       nbuf: int = DEFAULT_NBUF,
+                       bw: float | None = None) -> tuple[int, float]:
     """Stream int16 I/Q straight to disk. Returns (samples, elapsed seconds).
 
     Capture only -- no analysis in the loop -- because anything else falls
@@ -1774,7 +1775,7 @@ def capture_from_pluto(path: Path, *, uri: str, if_hz: float, fs: float,
 
     sdr = adi.Pluto(uri=uri)
     sdr.sample_rate = int(fs)
-    sdr.rx_rf_bandwidth = int(fs * 0.8)
+    sdr.rx_rf_bandwidth = int(rx_bandwidth_for(fs, bw))
     sdr.gain_control_mode_chan0 = "manual"
     sdr.rx_hardwaregain_chan0 = gain
     sdr.rx_lo = int(if_hz)
@@ -1794,6 +1795,65 @@ def capture_from_pluto(path: Path, *, uri: str, if_hz: float, fs: float,
             fh.write(out.tobytes())
             total += block.size
     return total, time.monotonic() - started
+
+
+# The AD9363 analog channel filter is only specified over this range, so a
+# derived bandwidth gets clamped into it rather than rejected by the driver.
+RX_BW_MIN_HZ = 200e3
+RX_BW_MAX_HZ = 20e6
+
+
+def rx_bandwidth_for(fs: float, override: float | None = None) -> float:
+    """Analog RX bandwidth to pair with a sample rate.
+
+    Defaults to 80% of fs: wide enough that the channel filter is not shaping
+    the occupied span, narrow enough to still reject the alias band. Widening
+    it with fs is what keeps the comparison across sample rates honest -- a
+    filter left at 2 MHz while fs went to 20 MS/s would be measuring the
+    filter, not the sample rate.
+    """
+    return min(max(override if override else fs * 0.8, RX_BW_MIN_HZ),
+               RX_BW_MAX_HZ)
+
+
+def capture_single_shot(path: Path, *, uri: str, if_hz: float, fs: float,
+                        seconds: float, gain: float,
+                        bw: float | None = None) -> tuple[int, float]:
+    """Capture the whole run as ONE hardware buffer. Returns (samples, seconds).
+
+    The streaming path above issues repeated rx() calls, and above roughly
+    2.5 MS/s this host cannot drain them fast enough -- samples are dropped
+    between buffers and the schedule the decoder is trying to time against
+    gets torn. Asking for the entire capture as a single buffer, with the
+    kernel queue depth set to 1 so nothing can be silently recycled behind
+    us, makes the acquisition one contiguous DMA and removes that failure
+    mode by construction.
+
+    Readout is slower than real time (USB has to move the whole buffer after
+    the fact) but that happens *after* acquisition and does not perforate it,
+    so the usual "did we keep up with real time?" check does not apply here.
+    """
+    import adi                                             # noqa: PLC0415
+
+    sdr = adi.Pluto(uri=uri)
+    sdr.sample_rate = int(fs)
+    sdr.rx_rf_bandwidth = int(rx_bandwidth_for(fs, bw))
+    sdr.gain_control_mode_chan0 = "manual"
+    sdr.rx_hardwaregain_chan0 = gain
+    sdr.rx_lo = int(if_hz)
+    sdr.rx_destroy_buffer()
+    sdr._rxadc.set_kernel_buffers_count(1)
+
+    want = int(seconds * fs)
+    sdr.rx_buffer_size = want
+    started = time.monotonic()
+    block = np.asarray(sdr.rx())
+    elapsed = time.monotonic() - started
+    out = np.empty(block.size * 2, dtype="<i2")
+    out[0::2] = np.real(block).astype("<i2")
+    out[1::2] = np.imag(block).astype("<i2")
+    path.write_bytes(out.tobytes())
+    return block.size, elapsed
 
 
 # ---------------------------------------------------------------------------
@@ -1948,7 +2008,16 @@ def build_parser() -> argparse.ArgumentParser:
     rx.add_argument("--seconds", type=float, default=DEFAULT_SECONDS)
     rx.add_argument("--gain", type=float, default=DEFAULT_GAIN)
     rx.add_argument("--uri", default=DEFAULT_URI)
-    rx.add_argument("--nbuf", type=int, default=DEFAULT_NBUF)
+    rx.add_argument("--nbuf", type=int, default=DEFAULT_NBUF,
+                    help="streaming buffer size (--capture-mode stream only)")
+    rx.add_argument("--capture-mode", choices=("single", "stream"),
+                    default="single",
+                    help="single: the whole run as one contiguous hardware "
+                         "buffer (default, required above ~2.5 MS/s); "
+                         "stream: repeated buffers, unlimited length but "
+                         "drops samples if the host falls behind")
+    rx.add_argument("--rx-bw", type=float, default=None,
+                    help="analog RX bandwidth in Hz (default 80%% of --fs)")
 
     an = p.add_argument_group("analysis")
     an.add_argument("--capture", default=None,
@@ -2081,13 +2150,26 @@ def main(argv: list[str] | None = None) -> int:
             work.mkdir(parents=True, exist_ok=True)
             tmp_path = work / f"hop-{uuid.uuid4().hex[:12]}.iq"
             out = str(tmp_path)
+        bw = rx_bandwidth_for(args.fs, args.rx_bw)
         print(f"\n  capturing {args.seconds:g} s from {args.uri} -> {out}")
-        count, elapsed = capture_from_pluto(
-            Path(out), uri=args.uri, if_hz=centre, fs=args.fs,
-            seconds=args.seconds, gain=args.gain, nbuf=args.nbuf)
-        live = count / args.fs / elapsed
-        print(f"  captured {count} samples in {elapsed:.2f} s "
-              f"({live*100:.1f}% of real time)")
+        print(f"  {args.fs/1e6:g} MS/s, {bw/1e6:g} MHz RF bandwidth, "
+              f"{args.capture_mode} buffer")
+        if args.capture_mode == "single":
+            count, elapsed = capture_single_shot(
+                Path(out), uri=args.uri, if_hz=centre, fs=args.fs,
+                seconds=args.seconds, gain=args.gain, bw=args.rx_bw)
+            print(f"  captured {count} samples as one contiguous buffer "
+                  f"({count/args.fs*1e3:.1f} ms of signal, read out in "
+                  f"{elapsed:.2f} s)")
+            live = 1.0
+        else:
+            count, elapsed = capture_from_pluto(
+                Path(out), uri=args.uri, if_hz=centre, fs=args.fs,
+                seconds=args.seconds, gain=args.gain, nbuf=args.nbuf,
+                bw=args.rx_bw)
+            live = count / args.fs / elapsed
+            print(f"  captured {count} samples in {elapsed:.2f} s "
+                  f"({live*100:.1f}% of real time)")
         if live < 0.98:
             print("  WARNING: capture fell behind real time; the timeline is "
                   "broken and alignment will suffer")

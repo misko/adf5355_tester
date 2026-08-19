@@ -876,12 +876,21 @@ class TestItChecksItselfAgainstTheBound(unittest.TestCase):
         self.assertLess(actual, 2.5 * predicted)
         self.assertGreater(actual, 0.4 * predicted)
 
-    def test_something_unmodelled_shows_up_as_excess_scatter_and_warns(self):
-        self.assertGreater(self.unmodelled.excess_scatter,
-                           hd.MAX_EXCESS_SCATTER)
-        self.assertTrue(any("scatter" in w for w in self.unmodelled.warnings),
-                        self.unmodelled.warnings)
-        self.assertFalse(self.unmodelled.trustworthy)
+    def test_something_unmodelled_shows_up_as_excess_scatter(self):
+        """Excess scatter is measured and reported, but cannot be a verdict.
+
+        On real hardware healthy captures run 54-128x the bound -- synthesiser
+        and LNB phase noise, which the bound does not model -- and this fixture's
+        deliberate disturbance lands at 86x, inside that range. So the statistic
+        cannot separate good from bad on this chain at any threshold. It is
+        reported because it moves informatively (200x+ when the band allowance
+        was too short), and the gates that do separate cleanly disown on their
+        own. See MAX_EXCESS_SCATTER in tools/hop_decode.py.
+        """
+        self.assertGreater(self.unmodelled.excess_scatter, 5.0)
+        self.assertFalse(hd.ENFORCE_EXCESS_SCATTER,
+                         "if this is ever enforced again, the bound must first "
+                         "carry a phase-noise term measured from the hardware")
 
     def test_modelling_it_clears_both_the_ratio_and_the_warning(self):
         self.assertLess(self.modelled.excess_scatter, hd.MAX_EXCESS_SCATTER)

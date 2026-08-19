@@ -708,12 +708,22 @@ randomising the tuning bias, the two levers disagree and the run says so.
 
 ### Uncertainty, and what it is dominated by
 
-Nothing here quotes a covariance standard error. The decoder's own standard
-errors are the *estimator's* — hundredths of a hertz — while the scatter that
-governs the answer is the tuning bias at a hundred hertz, which is not in that
-number at all. A covariance built on the former understates the answer's
-uncertainty by **more than tenfold**, and there is a test that asserts exactly
-that.
+Nothing here quotes a covariance standard error as the answer. The decoder's
+own standard errors are the *estimator's* — hundredths of a hertz — while the
+scatter that governs the answer is the tuning bias at a hundred hertz, which is
+not in that number at all. A covariance built on the decoder's errors alone
+understates the answer's uncertainty by **more than tenfold**, and there is a
+test that asserts exactly that.
+
+Be precise about which covariance that is, though, because the report prints
+another one beside it. `fit_wide` estimates the tuning bias as a variance
+component from the run's own residuals and puts it in the weights, and *that*
+covariance agrees with the resample to a few percent — measured at 0.0284 ppm
+against a 0.0285 ppm resample over 200 synthetic 25-sweep runs. So the resample
+is not rescuing the answer from a broken covariance; it is quoted because it is
+model-free, and it is what catches the case where the variance component itself
+is wrong. The `covariance` column in the report is there so the gap, when there
+is one, is visible.
 
 Instead: a **bootstrap over sweeps** and a **leave-one-sweep-out jackknife**,
 with the larger of the two quoted. The sweep is the resampling unit because it
@@ -731,42 +741,74 @@ x_c,
 which for 127 Hz, four clusters evenly spread over 0.95–2.15 GHz, is
 **0.142 / √S ppm**:
 
-| sweeps | captures | run time | σ(d_rx) predicted | measured | σ(d_lnb) measured |
-|---:|---:|---:|---:|---:|---:|
-| 10 | 40 | ~6 min | 0.045 ppm | 0.043 ppm | 74 Hz on 9.75 GHz |
-| 25 | 100 | ~15 min | 0.028 ppm | 0.028 ppm | 49 Hz |
-| 50 | 200 | ~30 min | 0.020 ppm | 0.023 ppm | 39 Hz |
+| sweeps | captures | run time | σ(d_rx) predicted | measured | quoted | 95% covered | σ(d_lnb) |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 10 | 40 | ~7 min | 0.045 ppm | 0.041 ppm | 0.046 | 95% | 74 Hz on 9.75 GHz |
+| 25 | 100 | ~17 min | 0.028 ppm | 0.028 ppm | 0.029 | 93% | 49 Hz |
+| 50 | 200 | ~33 min | 0.020 ppm | 0.020 ppm | 0.020 | 91% | 35 Hz |
 
-"Measured" is the true scatter over 120 synthetic runs at each size, against
-the σ the resample quoted: it agreed to 1% at 10 and 25 sweeps and was 14%
-optimistic at 50, and the nominal 95% interval covered 88–93%. So **treat the
-quoted 1σ as good to about 15%**. Below 8 sweeps a resample over sweeps has too
-few blocks to be believed at all — at 5 sweeps the interval covered only 71% —
-which is why the run refuses to be trusted below `MIN_SWEEPS`.
+"Measured" is the true scatter of the answer about the injected truth, over
+independently synthesised runs — 520 at 25 sweeps, 120 at each of the others,
+generated from the forward model rather than from this file's own synthesiser.
+"Quoted" is the σ the resample reported on the same runs. They agree to about
+5%, and the nominal 95% interval covered 91–95%. So **treat the quoted 1σ as
+good to about 10%, and the 95% interval as nearer 93%**. Below 8 sweeps a
+resample over sweeps has too few blocks to be believed: at 5 sweeps the d_rx
+interval covered 86%, d_lnb's quoted σ was 4.5× its true scatter, and the
+variogram raised a false alarm on 13 runs in 100 against 1 in 100 at eight. At
+eight sweeps everything is back in line (93% covered, σ within 3%), which is
+why `MIN_SWEEPS` is 8 and why the run refuses to be trusted below it.
+
+The run times are wall clock, not capture time: on a Pi the decode of one 3 s
+capture takes about 5.8 s, so a capture costs about 10 s and 100 of them cost
+17 minutes. The transmitter's `CYCLES` has to cover *that*, which is why its
+default is 16000 (75 minutes) and not something derived from the 3.
 
 Against the ±0.3 ppm the single-cluster method quotes today, a fifteen-minute
 run is **about eleven times tighter**, and the improvement keeps going as √N
 until something in the "not in the budget" list below becomes the limit.
 
 **The dominant term is the receiver's tuning bias, by a very long way.** In a
-25-sweep run it contributes 0.028 ppm, against 0.000004 ppm from the frequency
-estimator (0.015 Hz per capture over the same lever), 0.0000001 ppm from the
+25-sweep run it contributes 0.028 ppm, against 0.0001 ppm from the frequency
+estimator (0.02–0.08 Hz per capture, measured end to end from synthetic I/Q at
+10 dB, over the same lever), 0.0000001 ppm from the
 ADF5355's own frequency plan (worst point 0.43 mHz from nominal across the
 whole lever arm), and 0.0001 ppm from the exact-versus-linearised inversion,
-which is done exactly anyway. Everything except the tuning bias is
-five or more orders of magnitude down.
+which is done exactly anyway. Everything except the tuning bias is two to
+seven orders of magnitude down, and nothing else is within a factor of 200.
 
 What is *not* in that budget, because no resample can see it:
 
+* **A tuning bias that TRENDS with rx_lo across the lever.** This is the one
+  that matters most, and it is worth being blunt about. The dither randomises
+  the bias *locally*, over ±450 kHz; it does nothing about a component that
+  varies smoothly across the 1.2 GHz between the outermost clusters. Such a
+  component lands on d_rx one for one: a slope of k Hz per Hz of tuning shifts
+  d_rx by exactly k. Injected into a 25-sweep run, k = 0.1 ppm moved the answer
+  by 0.072 ppm and the two-lever comparison read only 2.3σ — it passed. The
+  check bites at about **0.15 ppm**. So the *precision* of a 25-sweep run is
+  0.028 ppm and its *accuracy* against this one failure is certified only to
+  about 0.15 ppm at 3σ, or 0.05 ppm at 1σ. If the 362 Hz of tuning bias this
+  hardware showed across eight tunings is mostly a trend rather than a scatter,
+  it is worth up to 0.3 ppm and the two levers will disagree loudly — which is
+  why the `d_rx by lever` lines are the first thing to read in the report, not
+  the last.
 * **A response that curves with frequency.** An LNB band edge, a filter, a
   reflection: a bias, not a scatter. The per-cluster residuals are printed and a
-  χ² on them fails the run.
+  χ² on them fails the run — measured sensitivity, at 25 sweeps: a 300 Hz
+  offset on one cluster is caught, 100 Hz is not (and 100 Hz is worth about
+  0.02 ppm, which is inside the noise anyway).
 * **A tuning bias that the dither does not randomise.** The variogram is the
-  check, and it fails the run too.
+  check, and it fails the run too — it caught 3 of 4 synthetic runs whose bias
+  was smooth across the dither window.
 * **The Pluto's own reference moving during the run.** The fit assumes one
-  d_rx; the split-half comparison is the check, and a difference well outside
-  the quoted uncertainty fails the run. Let the radio reach thermal steady
-  state first.
+  d_rx; the split-half comparison is the check. "Well outside" means
+  `SPLIT_HALF_SIGMA * SPLIT_HALF_SCALE` times the quoted σ, and the scale is
+  **2**, not √2: each half is fitted from half the sweeps so carries √2 times
+  the whole run's σ, and the two are independent, so their difference scatters
+  by 2× it. Measured directly, 1.97×. Scaling by √2 makes a nominal 3σ test
+  into a 2.1σ one and condemns roughly one blameless run in thirty. Let the
+  radio reach thermal steady state first.
 * **d_tx.** Three clocks are involved and only two can be separated. Since
   f_RF = f_IF + f_LO, a transmitter reference error splits into one piece
   scaling with f_IF and one that does not — exactly the two slots d_rx and
@@ -800,9 +842,21 @@ nearest rival`** measured 4.3–4.7× for six points on synthetic captures at
 10 dB, against a geometric ceiling of 6× — near 1× means the comb search
 cannot tell the right comb from a shifted copy, and the decoder fails the
 capture for it. **`dwell halves`** should be zero within its own error bar; if it
-is not, raise `BAND_EXTRA_MS` until it is, because that is the VCO band search
-leaking into the measurement. **`vs the bound`** should be near 1×; far above
-means something unmodelled is moving and the precision is not the accuracy.
+is not, raise `BAND_EXTRA_MS` until it is — **at both ends**, because it is a
+schedule parameter and the two must agree — since that is the VCO band search
+leaking into the measurement. Do *not* reach for `--drop-band-change` as the
+fix: the schedule repeats, so whichever point leads a block leads it every
+period, and dropping those dwells drops those points outright (2 of 6 at the
+defaults) and disowns the capture. It is a diagnostic — decode the same capture
+both ways and see whether the answer moves — not a remedy. **`vs the bound`**
+should be near 1×; far above means something unmodelled is moving and the
+precision is not the accuracy.
+
+And read **`d_rx by lever`** on the final report before anything else. It is the
+only check on a receiver bias that trends with rx_lo across the lever arm, which
+is the one error that lands on d_rx one for one and that no amount of dithering,
+sweeping or resampling can remove. The report now prints what a pass is worth in
+ppm, and that number — not the resample — is the honest accuracy.
 
 Let the Pluto reach thermal steady state before starting. The fit assumes one
 d_rx for the whole run and the split-half check will say so if that is wrong,

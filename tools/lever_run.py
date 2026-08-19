@@ -86,6 +86,13 @@ DEFAULT_URI = "ip:192.168.2.1"
 # never sees these numbers.
 DEFAULT_D_RX_GUESS = 8.94e-6
 DEFAULT_LO_ERROR_HZ = 94_000.0
+# What one capture costs BESIDES its own length: the retune and settle, the
+# write, and the decode -- which is the big one. Measured on a Pi 4: 5.8 s to
+# decode one 3 s capture of a 4-cluster schedule, plus about 0.4 s for
+# everything else. This is not cosmetic; it is what says whether the
+# transmitter's --cycles outlasts the receiver's --sweeps, and a run whose
+# transmitter stops halfway loses every capture after that point.
+PER_CAPTURE_OVERHEAD_S = 7.0
 
 
 def tuning_for(cluster_if_hz: float, dither_hz: float, *, lo_hz: float,
@@ -352,7 +359,7 @@ def main(argv: list[str] | None = None) -> int:
 
     visits = lf.plan_visits(args.visit_seed, plan.clusters, args.sweeps,
                             args.dither_khz * 1e3)
-    per_capture = args.seconds + 6.0
+    per_capture = args.seconds + PER_CAPTURE_OVERHEAD_S
     print(f"\n  run          : {len(visits)} captures = {args.sweeps} sweeps "
           f"of {plan.clusters} clusters, {args.seconds:g} s each")
     print(f"  listening    : {args.seconds/period:.1f} periods per capture "
@@ -373,7 +380,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  WARNING: {args.seconds:g} s is under two periods "
               f"({2*period:.2f} s); some points may never be heard")
     print(f"  rough time   : {len(visits)*per_capture/60:.0f} min including "
-          f"decode")
+          f"decode ({args.seconds:g} s capture + {PER_CAPTURE_OVERHEAD_S:g} s "
+          f"retune, write and decode, measured on a Pi 4)")
+    print(f"  transmitter  : must still be hopping {len(visits)*per_capture/60:.0f} "
+          f"min from now -- check adf5355_rf_lever.sh's CYCLES covers it")
 
     if not (args.open_radio or args.synthetic):
         print("\n  DRY RUN: no radio was opened and nothing was captured. "
@@ -409,7 +419,7 @@ def main(argv: list[str] | None = None) -> int:
                    "injected_d_lnb": args.inject_d_lnb,
                    "injected_drift_hz_s": args.inject_drift,
                    "injected_bias_hz": args.inject_bias}
-        overhead = 6.0
+        overhead = PER_CAPTURE_OVERHEAD_S
         synthetic = {
             "d_rx": args.inject_d_rx, "d_lnb": args.inject_d_lnb,
             "drift_hz_s": args.inject_drift, "snr_db": args.snr_db,

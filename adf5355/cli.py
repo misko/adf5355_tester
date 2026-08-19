@@ -385,8 +385,10 @@ def cmd_hop_lever(args) -> int:
                             args.band_extra_ms / 1e3))
     print(f"  plan error: worst point is {worst*1e3:.4f} mHz from nominal "
           f"across the whole lever arm")
-    print(f"  run time  : {hops[-1].end_s:.1f} s total over {args.cycles} "
-          f"cycles -- leave this running for the whole receiver run")
+    print(f"  run time  : {hops[-1].end_s:.1f} s = {hops[-1].end_s/60:.0f} min "
+          f"total over {args.cycles} cycles -- leave this running for the "
+          f"whole receiver run, which is about 10 s per capture (not 3), so "
+          f"25 sweeps of 4 clusters is ~17 min and 50 is ~33")
     print(f"\n  the receiver needs only: seed 0x{args.seed:X}, "
           f"{args.low_ghz}-{args.high_ghz} GHz in {args.clusters} clusters, "
           f"{args.cluster_points} points over {args.span_khz:g} kHz, "
@@ -659,10 +661,15 @@ def build_parser() -> argparse.ArgumentParser:
                      default=DEFAULT_PERIOD_CYCLES,
                      help="cycles before the pattern repeats; bounds the "
                           "receiver's epoch search")
-    lev.add_argument("--cycles", type=int, default=8000,
-                     help="cycles to transmit (default 8000, about an hour); "
-                          "must outlast the whole receiver run, which is "
-                          "minutes per sweep")
+    lev.add_argument("--cycles", type=int, default=16000,
+                     help="cycles to transmit (default 16000: at the default "
+                          "dwell one cycle is 280 ms, so that is 75 minutes). "
+                          "It must outlast the WHOLE receiver run, and the "
+                          "receiver spends far more time decoding than "
+                          "listening -- about 10 s per 3 s capture on a Pi -- "
+                          "so 50 sweeps of 4 clusters is over half an hour. "
+                          "The printed run time below is the number to "
+                          "compare against, not the capture seconds")
     lev.add_argument("--lo-hz", type=float, default=9.75e9,
                      help="nominal LNB LO, printed so both ends agree on what "
                           "IF each cluster lands at")

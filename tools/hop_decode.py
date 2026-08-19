@@ -296,6 +296,24 @@ def comb_ambiguity(if_nom: np.ndarray, tol_hz: float) -> float:
     return float((hit.min(axis=2) <= tol_hz).sum(axis=1).max()) / n
 
 
+def comb_margin_floor(if_nom: np.ndarray, tol_hz: float) -> float:
+    """Smallest comb margin this frequency plan is allowed to show.
+
+    The ceiling is geometric -- ``1 / comb_ambiguity`` -- and unreachable in
+    practice, because a rival peak also collects the noise under its own bins.
+    The floor is a fixed fraction of the way from 1x (hopeless, a mis-lock) to
+    that ceiling, so a plan that genuinely cannot beat 1.05x is not condemned
+    for it while a Golomb ruler that should show 6x and shows 1.2x is.
+
+    Kept as a named function rather than three inline terms so the threshold
+    is something a test can pin: with it inline, changing
+    ``COMB_MARGIN_FRACTION`` to zero disables the whole mis-lock guard and
+    nothing notices.
+    """
+    allowed = 1.0 / max(comb_ambiguity(if_nom, tol_hz), 1e-9)
+    return 1.0 + COMB_MARGIN_FRACTION * (allowed - 1.0)
+
+
 # ---------------------------------------------------------------------------
 # step 3: one envelope per frequency point
 # ---------------------------------------------------------------------------
@@ -786,8 +804,14 @@ def visit_windows(hops: list[Hop], points: int, period_cycles: int,
         # allowance it carries, so skipping ``hop.settle_s`` leaves a measured
         # window the same length as every other dwell's -- no point is lost and
         # nothing is measured through a band search. ``drop_band_change``
-        # throws those dwells away entirely instead, which is the belt-and-
-        # braces answer if the half-split ever says the allowance is short.
+        # throws those dwells away entirely instead. That is a DIAGNOSTIC, not
+        # a remedy, and the difference matters: the schedule is periodic, so
+        # the points that lead a block lead it every period, and dropping
+        # those dwells drops those points outright -- ``points // block`` of
+        # them, 2 of 6 at the defaults, which earns a partial-recovery warning
+        # and disowns the capture. Use it to ANSWER the question "is the band
+        # settle what is wrong?" by comparing the two decodes; fix it by
+        # raising --band-extra-ms at BOTH ends.
         if hop.band_change and drop_band_change:
             continue
         dwell = hop.end_s - hop.start_s
@@ -1385,9 +1409,9 @@ def decode(source, *, fs: float, centre_hz: float,
     # onto itself simply cannot show a big margin, so judging every layout
     # against one fixed number would either excuse the dangerous ones or
     # condemn the safe ones.
-    ambiguity = comb_ambiguity(if_nom, float(fbins[1] - fbins[0]))
-    allowed = 1.0 / max(ambiguity, 1e-9)
-    if margin < 1.0 + COMB_MARGIN_FRACTION * (allowed - 1.0):
+    tol_hz = float(fbins[1] - fbins[0])
+    allowed = 1.0 / max(comb_ambiguity(if_nom, tol_hz), 1e-9)
+    if margin < comb_margin_floor(if_nom, tol_hz):
         warnings.append(
             f"the comb search found a rival peak only {margin:.2f}x below the "
             f"winner, where this frequency plan should give about "
@@ -1856,7 +1880,13 @@ def build_parser() -> argparse.ArgumentParser:
                           "the receiver skips")
     clu.add_argument("--drop-band-change", action="store_true",
                      help="discard band-changing dwells outright instead of "
-                          "skipping their allowance")
+                          "skipping their allowance. A DIAGNOSTIC: the "
+                          "schedule is periodic, so the points that lead a "
+                          "block lead it every period and this loses them "
+                          "entirely (2 of 6 at the defaults), which disowns "
+                          "the capture. Compare the two decodes to find out "
+                          "whether the band settle is the problem; fix it by "
+                          "raising --band-extra-ms at BOTH ends")
 
     rx = p.add_argument_group("receive chain")
     rx.add_argument("--lo-hz", type=float, default=DEFAULT_LO_HZ,

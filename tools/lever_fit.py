@@ -116,9 +116,23 @@ DEFAULT_BOOTSTRAP = 400
 # tilted by anything but the sample clock.
 NARROW_MODES = ("check", "combine", "off")
 NARROW_AGREE_SIGMA = 3.0
+# How many sigma the two halves of a run may differ by before the answer is
+# called unsteady, and the SCALE that converts the quoted uncertainty into the
+# sigma of that difference. Each half is fitted from half the sweeps, so its
+# own standard error is sqrt(2) times the whole run's; the two halves are
+# independent, so their difference scatters by sqrt(2)*sqrt(2) = 2 times the
+# whole run's. Using sqrt(2) here instead -- as if the halves were the run --
+# turns a nominal 3-sigma test into a 2.1-sigma one and fails roughly one
+# blameless run in thirty. Measured directly: over 120 synthetic runs at 25
+# sweeps the split-half difference scattered 1.97x the quoted sigma.
+SPLIT_HALF_SIGMA = 3.0
+SPLIT_HALF_SCALE = 2.0
 # Below this many sweeps a resample over sweeps has too few blocks to be
-# believed: measured on synthetic runs, a nominal 95% interval covered 93% of
-# the time at 25 sweeps and only 71% at 5.
+# believed. Measured on independently synthesised runs, a nominal 95% interval
+# covered 93% at 25 sweeps and 93% at 8, but only 86% at 5 -- and at 5 the
+# d_lnb interval came apart entirely (quoted sigma 4.5x its true scatter) and
+# the variogram raised a false alarm on 13 runs in 100, against 1 in 100 at
+# eight. Eight is where everything comes back into line.
 MIN_SWEEPS = 8
 # Below this a residual scatter is float dust rather than a measurement.
 NOTHING_TO_TEST_HZ = 1e-6
@@ -326,9 +340,14 @@ class Dataset:
     def by_sweep(self, sweeps) -> "Dataset":
         """Rebuild from a list of sweeps, which may repeat.
 
-        A sweep drawn twice has to become two DISTINCT sweeps, or the fit gives
-        the pair one shared free offset and quietly halves the very noise the
-        resample exists to represent.
+        A sweep drawn twice becomes two DISTINCT sweeps. For the SLOPE that
+        makes no numerical difference -- two identical copies centred on one
+        shared mean and centred on two separate means come to the same thing,
+        and that was checked rather than assumed. What it does buy is an
+        honest parameter count: the bootstrap fit then has as many free
+        offsets as it has sweeps, so its degrees of freedom, and through them
+        the fitted tuning-bias variance component, match the model that is
+        actually being fitted instead of a smaller one.
         """
         idx, labels = [], []
         for label, s in enumerate(sweeps):
@@ -815,6 +834,12 @@ def split_half(data: Dataset, drift_order: int,
     uncertainty means the answer is an average over something that is moving,
     which is a fact about the hardware rather than a bug in the fit, but it has
     to be known before the number is written down.
+
+    What "well outside" means is set by SPLIT_HALF_SCALE, and it is not
+    sqrt(2). Each half is fitted from half the sweeps, so each carries about
+    sqrt(2) times the whole run's standard error, and the two are independent:
+    their difference scatters by 2 times it. Measured directly on 120
+    synthetic runs at 25 sweeps: 1.97x.
     """
     sweeps = np.unique(data.sweep)
     if sweeps.size < 2 * MIN_SWEEPS:
@@ -887,6 +912,13 @@ class LeverReport:
     design_stderr: float          # what the design allows, given sigma_bias
     covariance_stderr: float      # what a covariance alone would have claimed
     agreement_sigma: float
+    # The denominator of that sigma, in slope units. Multiplied by
+    # NARROW_AGREE_SIGMA it IS the threshold the two-lever check applies, and
+    # therefore the size of the one systematic no resample here can see: a
+    # receiver bias that trends with rx_lo lands on d_rx one for one and only
+    # this check can refuse it. Carried on the report so the printed accuracy
+    # and the applied test cannot drift apart.
+    agreement_denom: float = float("nan")
     variogram: list = field(default_factory=list)
     per_cluster: list = field(default_factory=list)
     leave_one_out: list = field(default_factory=list)
@@ -917,6 +949,8 @@ class LeverReport:
             "d_rx_narrow": self.est.d_rx_narrow,
             "narrow_excess_sd": self.est.narrow_tau,
             "agreement_sigma": self.agreement_sigma,
+            "agreement_threshold_ppm": (NARROW_AGREE_SIGMA
+                                        * self.agreement_denom * 1e6),
             "sigma_bias_hz": self.est.sigma_bias_hz,
             "design_stderr": self.design_stderr,
             "covariance_stderr": self.covariance_stderr,
@@ -1006,7 +1040,7 @@ def analyse(records: list[CaptureRecord], *, lo_hz: float = DEFAULT_LO_HZ,
         span_s=float(data.t.max() - data.t.min()), t_ref_s=t_ref,
         use_narrow=use_narrow, narrow_reason=reason, est=est, res=res,
         design_stderr=design_se, covariance_stderr=cov_se,
-        agreement_sigma=agree,
+        agreement_sigma=agree, agreement_denom=denom,
         variogram=variogram(data, wide.residuals),
         per_cluster=cluster_residuals(data, wide.residuals),
         leave_one_out=cluster_leave_one_out(data, drift_order, use_narrow),
@@ -1064,7 +1098,7 @@ def analyse(records: list[CaptureRecord], *, lo_hz: float = DEFAULT_LO_HZ,
                     f"this model does not have, and it is sitting on d_rx")
     first, second, diff = report.split
     if np.isfinite(diff) and res.d_rx_stderr > 0 and \
-            abs(diff) > 3.0 * res.d_rx_stderr * math.sqrt(2.0):
+            abs(diff) > SPLIT_HALF_SIGMA * SPLIT_HALF_SCALE * res.d_rx_stderr:
         w.append(
             f"d_rx moved between the halves of the run: {first*1e6:+.4f} then "
             f"{second*1e6:+.4f} ppm. The answer is then an average over "
@@ -1106,6 +1140,17 @@ def format_report(rep: LeverReport) -> str:
         f"                 they differ by {rep.agreement_sigma:.1f} sigma; "
         f"narrow lever {'FOLDED IN' if rep.use_narrow else 'not folded in'}",
         f"                 -- {rep.narrow_reason}",
+        f"                 READ THIS LINE FIRST. It is the only check on the "
+        f"one error the resample",
+        f"                 cannot see: a receiver bias that TRENDS with rx_lo "
+        f"across the lever lands",
+        f"                 on d_rx one for one, and the dither cannot touch "
+        f"it. Passing certifies",
+        f"                 that bias only to about "
+        f"{NARROW_AGREE_SIGMA*rep.agreement_denom*1e6:.3f}"
+        f" ppm, which is the accuracy here --",
+        f"                 the {r.d_rx_stderr*1e6:.4f} ppm above is the "
+        f"precision.",
         f"  tuning bias  : {e.sigma_bias_hz:.1f} Hz sd per capture, fitted "
         f"from this run's own scatter",
         f"  slope scatter: {e.narrow_tau*1e6:.4f} ppm sd beyond the estimator's "

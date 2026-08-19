@@ -59,7 +59,17 @@ JITTER="${JITTER:-0}"
 PERIOD_CYCLES="${PERIOD_CYCLES:-1}"
 LO_HZ="${LO_HZ:-9.75e9}"              # nominal LNB LO, for the printout only
 # ---- transmit only --------------------------------------------------------
-CYCLES="${CYCLES:-8000}"              # must outlast the whole receiver run
+CYCLES="${CYCLES:-16000}"             # must outlast the whole receiver run.
+                                      # One cycle is CLUSTERS*CLUSTER_POINTS
+                                      # dwells plus one BAND_EXTRA_MS per
+                                      # block: 280 ms at these defaults, so
+                                      # 16000 cycles is 75 minutes. The
+                                      # receiver spends about 10 s per capture
+                                      # -- 3 s listening and the rest
+                                      # decoding -- so 25 sweeps is ~17 min
+                                      # and 50 sweeps ~33. Compare against the
+                                      # "run time" this script prints, not
+                                      # against SECONDS_LISTEN.
 POWER="${POWER:-0}"                   # 0 = -4 dBm, the lowest step
 CHANNEL="${CHANNEL:-B}"               # B = 6.8-13.6 GHz doubler output (OB)
 SPI_HZ="${SPI_HZ:-1000000}"

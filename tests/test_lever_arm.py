@@ -123,6 +123,52 @@ class ClusterPlanTests(unittest.TestCase):
         self.assertAlmostEqual(plan.if_nom(0, LO)[0], plan.freqs(0)[0] - LO)
 
 
+# The cluster schedule is a PROTOCOL between two programs that never speak to
+# each other: a transmitter that has been running for an hour and a receiver
+# started afterwards, possibly from a different checkout. Structural tests --
+# "every pair appears once", "blocks do not straddle clusters" -- are all
+# satisfied by a schedule that is simply a different one, and a receiver
+# regenerating a different schedule mislabels every point and returns a
+# confident wrong answer. Only a recorded answer catches that, so here it is,
+# for the shipped defaults: seed 0xC0FFEE, 4 clusters over 10.70-11.90 GHz, 6
+# points on a 720 kHz Golomb ruler, 10 ms dwells in blocks of 3, 5 ms of band
+# allowance. Changing any of these numbers is a protocol change and both ends
+# have to move together.
+REFERENCE_RULER_HZ = (0, 42000, 169000, 424000, 508000, 720000)
+REFERENCE_CLUSTER_ORDER = (1, 1, 1, 3, 3, 3, 2, 2, 2, 0, 0, 0,
+                           3, 3, 3, 2, 2, 2, 1, 1, 1, 0, 0, 0)
+REFERENCE_POINT_ORDER = (1, 4, 0, 4, 3, 2, 3, 2, 4, 5, 0, 1,
+                         0, 1, 5, 0, 5, 1, 3, 2, 5, 3, 2, 4)
+REFERENCE_CLUSTER0_HZ = (10699640000, 10699682000, 10699809000,
+                         10700064000, 10700148000, 10700360000)
+
+
+class ClusterProtocolPinTests(unittest.TestCase):
+    """Golden vectors. A different schedule that passes every other test is
+    still a different schedule, and on the air it is a mislabelling."""
+
+    def test_the_golomb_ruler_is_pinned(self):
+        self.assertEqual(standard_plan().offsets, REFERENCE_RULER_HZ)
+
+    def test_one_period_of_the_cluster_schedule_is_pinned(self):
+        plan = standard_plan()
+        hops = make_cluster_schedule(DEFAULT_SEED, plan, 0.010, 2,
+                                     DEFAULT_BLOCK, 0.0, 1,
+                                     DEFAULT_BAND_EXTRA_S)
+        per = plan.clusters * plan.points
+        self.assertEqual(tuple(h.cluster for h in hops[:per]),
+                         REFERENCE_CLUSTER_ORDER)
+        self.assertEqual(tuple(h.point for h in hops[:per]),
+                         REFERENCE_POINT_ORDER)
+        self.assertEqual(tuple(round(h.dwell_s, 9) for h in hops[:per]),
+                         tuple(0.015 if i % DEFAULT_BLOCK == 0 else 0.010
+                               for i in range(per)))
+
+    def test_the_transmitted_frequencies_are_pinned(self):
+        self.assertEqual(tuple(standard_plan().freqs(0)),
+                         REFERENCE_CLUSTER0_HZ)
+
+
 class ClusterScheduleTests(unittest.TestCase):
     def setUp(self):
         self.plan = standard_plan()
@@ -381,6 +427,32 @@ class OneClusterDecodeTests(unittest.TestCase):
         self.assertAlmostEqual(dropped.mean_error_hz, kept.mean_error_hz,
                                delta=3.0)
 
+    def test_dropping_band_changes_costs_whole_points_so_it_is_no_remedy(self):
+        # The schedule repeats, so whichever point leads a block leads it every
+        # period. Throwing those dwells away throws the point away with them --
+        # points//block of them -- and the capture is disowned for partial
+        # recovery. It is a diagnostic, and the docs must not offer it as the
+        # fix; the fix is a longer --band-extra-ms at BOTH ends.
+        plan = standard_plan()
+        centre = float(np.mean(plan.if_nom(1, LO)))
+        common = dict(fs=FS, centre_hz=centre, lo_hz=LO, cluster_plan=plan,
+                      cluster=1, min_hop_s=DWELL, block=BLOCK,
+                      band_extra_s=BAND_EXTRA, frame=FRAME, decimate=DECIMATE)
+        x = hd.synthesise_cluster(plan, 1, fs=FS, centre_hz=centre,
+                                  min_hop_s=DWELL, block=BLOCK,
+                                  band_extra_s=BAND_EXTRA, lo_hz=LO,
+                                  seconds=SECONDS, start_at_s=0.0371,
+                                  d_rx=D_RX, d_lnb=D_LNB, snr_db=12.0)
+        kept = hd.decode(x, **common)
+        dropped = hd.decode(x, drop_band_change=True, **common)
+        self.assertEqual(kept.recovered, plan.points)
+        self.assertEqual(dropped.recovered, plan.points - plan.points // BLOCK)
+        self.assertFalse(dropped.trustworthy)
+        self.assertTrue(any("points recovered" in w for w in dropped.warnings),
+                        dropped.warnings)
+        # and the help says so, so an operator is not sent down that road
+        self.assertIn("DIAGNOSTIC", hd.build_parser().format_help())
+
     def test_the_passband_warning_fires_when_the_dither_is_too_wide(self):
         _, _, r = self.decode_one(0, dither=180e3)
         self.assertTrue(any("half-passband" in w for w in r.warnings),
@@ -593,6 +665,148 @@ class TuningBiasTests(unittest.TestCase):
         # Twenty-five trials cannot resolve 93 from 95, so this asserts only
         # that the interval is not grossly optimistic.
         self.assertGreaterEqual(hits, 20)
+
+
+class ArithmeticThatNoOtherTestPinsTests(unittest.TestCase):
+    """Small load-bearing choices that a wrong answer would slip past.
+
+    Every test here was written because MUTATING the line it covers left all
+    343 other tests passing. A rule with no test that can fail is a comment.
+    """
+
+    def test_the_quoted_uncertainty_is_the_larger_of_the_two_resamples(self):
+        # The bootstrap is optimistic with few sweeps and the jackknife is
+        # poor on a rough statistic; they are both run precisely so the WIDER
+        # can be quoted. Quoting the narrower instead is a silent, plausible,
+        # always-smaller answer.
+        recs = run_records(sweeps=25, sigma_bias_hz=127.0, noise_seed=71)
+        data = lf.Dataset.from_records(recs)
+        res = lf.resample(data, LO, draws=200, seed=3)
+        self.assertGreater(res.d_rx_bootstrap_stderr, 0.0)
+        self.assertGreater(res.d_rx_jackknife_stderr, 0.0)
+        self.assertAlmostEqual(
+            res.d_rx_stderr,
+            max(res.d_rx_bootstrap_stderr, res.d_rx_jackknife_stderr),
+            places=12)
+        self.assertGreaterEqual(res.d_lnb_stderr, res.d_lnb_jackknife_stderr)
+        # ...and the two really do differ, so the max is not a no-op here.
+        self.assertGreater(
+            max(res.d_rx_bootstrap_stderr, res.d_rx_jackknife_stderr)
+            / min(res.d_rx_bootstrap_stderr, res.d_rx_jackknife_stderr),
+            1.02)
+
+    def test_a_sweep_drawn_twice_becomes_two_sweeps(self):
+        # The bootstrap draws sweeps with replacement, and the fit gives one
+        # free offset per sweep. A duplicate that keeps its original label
+        # would leave the fit with fewer parameters than the model it claims
+        # to be, and the tuning-bias variance component divides by exactly
+        # that count.
+        recs = run_records(sweeps=12, sigma_bias_hz=127.0, noise_seed=73)
+        data = lf.Dataset.from_records(recs)
+        sweeps = np.unique(data.sweep)
+        drawn = [sweeps[0], sweeps[0], sweeps[0]] + list(sweeps[1:])
+        got = data.by_sweep(np.array(drawn))
+        self.assertEqual(len(got), sum(int((data.sweep == s).sum())
+                                       for s in drawn))
+        self.assertEqual(np.unique(got.sweep).size, len(drawn))
+
+    def test_the_variance_component_uses_the_model_s_degrees_of_freedom(self):
+        # Method of moments: chi-square lands on its DOF, not on its point
+        # count. Dividing by n instead reads the tuning bias low by
+        # sqrt(n/dof) -- 14% at 25 sweeps -- and quietly shrinks the design
+        # standard error the operator plans the next run with.
+        rng = np.random.default_rng(7)
+        n, dof = 400, 317
+        resid = rng.normal(0.0, 100.0, n)
+        got = lf._variance_component(resid, np.zeros(n), dof)
+        self.assertAlmostEqual(got, float(np.sqrt((resid ** 2).sum() / dof)),
+                               places=6)
+        self.assertGreater(got / float(np.sqrt((resid ** 2).sum() / n)), 1.10)
+        # and with a known per-point error it subtracts it rather than adding
+        sv = np.full(n, 30.0)
+        both = lf._variance_component(resid, sv, dof)
+        self.assertAlmostEqual(
+            both, float(np.sqrt(max((resid ** 2).sum() / dof - 900.0, 0.0))),
+            places=6)
+
+    def test_the_split_half_test_is_really_three_sigma(self):
+        # Each half is fitted from half the sweeps, so it carries sqrt(2)
+        # times the whole run's standard error; the halves are independent, so
+        # their DIFFERENCE scatters by 2x it. Scaling by sqrt(2) instead turns
+        # a nominal 3-sigma check into a 2.1-sigma one, which fails about one
+        # blameless run in thirty. Measured on 120 synthetic runs at 25
+        # sweeps: the difference scattered 1.97x the quoted sigma.
+        self.assertAlmostEqual(lf.SPLIT_HALF_SCALE, 2.0, places=12)
+        self.assertAlmostEqual(lf.SPLIT_HALF_SIGMA, 3.0, places=12)
+        diffs = []
+        for k in range(24):
+            recs = run_records(sweeps=25, sigma_bias_hz=127.0,
+                               noise_seed=900 + k)
+            data = lf.Dataset.from_records(recs)
+            _, _, d = lf.split_half(data, lf.DEFAULT_DRIFT_ORDER, False)
+            diffs.append(d)
+        quoted = lf.resample(lf.Dataset.from_records(
+            run_records(sweeps=25, sigma_bias_hz=127.0, noise_seed=900)),
+            LO, draws=200, seed=5).d_rx_stderr
+        ratio = float(np.std(diffs, ddof=1)) / quoted
+        self.assertGreater(ratio, 1.5)        # emphatically not sqrt(2)
+        self.assertLess(ratio, 2.6)
+
+    def test_a_bias_that_trends_with_the_tuning_lands_straight_on_d_rx(self):
+        # The one systematic no resample here can see. The dither randomises
+        # the tuning bias LOCALLY, over a few hundred kHz; a component that
+        # varies smoothly across the 1.2 GHz of lever arm is not randomised at
+        # all and enters d_rx one for one. The two-lever comparison is the
+        # only check on it, and the report has to say what a pass is worth.
+        base = run_records(sweeps=25, sigma_bias_hz=127.0, noise_seed=61)
+        clean = lf.analyse(base, lo_hz=LO, draws=150)
+        for k in (0.05e-6, 0.4e-6):
+            tilted = run_records(sweeps=25, sigma_bias_hz=127.0, noise_seed=61)
+            for r in tilted:
+                r.mean_error_hz -= k * (r.rx_lo_hz - 1.55e9)
+            rep = lf.analyse(tilted, lo_hz=LO, draws=150)
+            moved = rep.res.d_rx - clean.res.d_rx
+            self.assertAlmostEqual(moved, k, delta=0.05 * k)   # one for one
+            caught = any("levers disagree" in w for w in rep.warnings)
+            self.assertEqual(
+                caught, k > lf.NARROW_AGREE_SIGMA * rep.agreement_denom,
+                f"k={k*1e6:.3f} ppm against a threshold of "
+                f"{lf.NARROW_AGREE_SIGMA*rep.agreement_denom*1e6:.3f} ppm")
+
+    def test_the_report_quotes_the_accuracy_the_check_actually_applies(self):
+        # The printed "certifies only to about X ppm" must be the threshold
+        # the two-lever test really uses, not a second calculation of it.
+        recs = run_records(sweeps=25, sigma_bias_hz=127.0, noise_seed=63)
+        rep = lf.analyse(recs, lo_hz=LO, draws=100)
+        text = lf.format_report(rep)
+        want = lf.NARROW_AGREE_SIGMA * rep.agreement_denom * 1e6
+        self.assertIn(f"{want:.3f} ppm", text)
+        self.assertIn("READ THIS LINE FIRST", text)
+        self.assertGreater(want, rep.res.d_rx_stderr * 1e6)
+        self.assertAlmostEqual(rep.to_dict()["agreement_threshold_ppm"], want,
+                               places=9)
+
+    def test_the_comb_margin_floor_scales_with_what_the_plan_allows(self):
+        # The mis-lock guard. A Golomb ruler of six points may be held to a
+        # real threshold because its geometry allows 6x; a uniform comb of
+        # twenty may not, because its geometry allows only 1.05x and holding
+        # it to more would condemn it for something it cannot help.
+        tol = 2.5e6 / 512
+        golomb = np.asarray(standard_plan().if_nom(0, LO))
+        uniform = np.linspace(0.95e9, 0.95e9 + 1.71e6, 20)
+        floor_g = hd.comb_margin_floor(golomb, tol)
+        floor_u = hd.comb_margin_floor(uniform, tol)
+        self.assertAlmostEqual(floor_g, 1.0 + 0.3 * (6.0 - 1.0), delta=0.05)
+        self.assertLess(floor_u, 1.05)
+        self.assertGreater(floor_g, 2.0)      # a zeroed fraction gives 1.0
+        # and a real capture clears its own floor with room to spare
+        centre = float(np.mean(golomb))
+        iq = hd.synthesise_cluster(standard_plan(), 0, fs=2.5e6,
+                                   centre_hz=centre, seconds=1.2,
+                                   snr_db=10.0, noise_seed=4)
+        got = hd.decode(iq, fs=2.5e6, centre_hz=centre, lo_hz=LO,
+                        cluster_plan=standard_plan(), cluster=0)
+        self.assertGreater(got.comb_margin, floor_g)
 
 
 class RefusalTests(unittest.TestCase):
@@ -1057,12 +1271,35 @@ class LeverScriptTests(unittest.TestCase):
         self.assertGreater(float(self.rx["SECONDS_LISTEN"]), 2 * period)
 
     def test_the_transmitter_outlasts_the_whole_receiver_run(self):
-        captures = int(self.rx["SWEEPS"]) * int(self.rx["CLUSTERS"])
-        hops_per_cycle = int(self.tx["CLUSTERS"]) * int(self.tx["CLUSTER_POINTS"])
-        run_s = (int(self.tx["CYCLES"]) * hops_per_cycle
-                 * float(self.tx["HOP_MS"]) / 1e3)
-        # Every capture costs its own length plus a retune and a decode.
-        self.assertGreater(run_s, captures * float(self.rx["SECONDS_LISTEN"]))
+        # The trap here is comparing against SECONDS_LISTEN. A capture costs
+        # its own length plus a retune plus a DECODE, and on a Pi the decode is
+        # twice the capture: 3 s of listening is about 10 s of wall clock. Held
+        # against 3 s the check passes with a 7x margin it does not have, and a
+        # transmitter that stops halfway through loses every capture after it.
+        hops_per_cycle = (int(self.tx["CLUSTERS"])
+                          * int(self.tx["CLUSTER_POINTS"]))
+        blocks_per_cycle = (int(self.tx["CLUSTERS"])
+                            * int(self.tx["CLUSTER_POINTS"])
+                            // int(self.tx["BLOCK"]))
+        cycle_s = (hops_per_cycle * float(self.tx["HOP_MS"])
+                   + blocks_per_cycle * float(self.tx["BAND_EXTRA_MS"])) / 1e3
+        run_s = int(self.tx["CYCLES"]) * cycle_s
+        per_capture = (float(self.rx["SECONDS_LISTEN"])
+                       + lr.PER_CAPTURE_OVERHEAD_S)
+        for sweeps in (int(self.rx["SWEEPS"]), 50):
+            need = sweeps * int(self.rx["CLUSTERS"]) * per_capture
+            self.assertGreater(
+                run_s, 2.0 * need,
+                f"the transmitter runs {run_s/60:.0f} min, against "
+                f"{need/60:.0f} min for a {sweeps}-sweep receiver run; "
+                f"raise CYCLES in adf5355_rf_lever.sh")
+
+    def test_the_two_ends_agree_on_what_a_capture_costs(self):
+        # The transmitter's own printout quotes the receiver's per-capture
+        # cost, so the two must come from one number rather than two.
+        text = read_script(os.path.join(context.ROOT, "adf5355", "cli.py"))
+        self.assertIn("about 10 s per capture", text)
+        self.assertAlmostEqual(lr.PER_CAPTURE_OVERHEAD_S, 7.0, places=6)
 
     def test_the_sweep_count_is_enough_for_the_resample_to_mean_anything(self):
         self.assertGreaterEqual(int(self.rx["SWEEPS"]), lf.MIN_SWEEPS)

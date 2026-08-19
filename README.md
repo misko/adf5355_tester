@@ -238,6 +238,28 @@ true to the schedule.
 
 ---
 
+### Ready-made scripts
+
+Two scripts drive both ends of a calibration. Run them in separate shells, the
+transmitter first:
+
+```bash
+./adf5355_rf_ladder.sh      # transmit the ladder
+./sdr_listen.sh             # listen once and decode it
+```
+
+Both take the same ladder definition and both print it before starting, so a
+mismatch is visible rather than silent. Override from the environment:
+
+```bash
+STEPS=24 TOTAL_S=6.0 ./adf5355_rf_ladder.sh
+STEPS=24 TOTAL_S=6.0 SECONDS_LISTEN=40 ./sdr_listen.sh
+```
+
+`sdr_listen.sh` works out its own tuning from the ladder range and the LNB LO,
+and warns if the listen is shorter than one full cycle, if the span will not fit
+the sample rate, or if the shortest burst spans too few frames.
+
 ### Fast, narrow ladders: the whole cycle in one capture
 
 The Ku-band default steps 250 MHz between rungs, so a receiver has to retune for

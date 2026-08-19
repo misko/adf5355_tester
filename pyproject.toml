@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adf5355-tester"
+version = "0.1.0"
+description = "ADF5355 wideband synthesizer control for Raspberry Pi"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["spidev", "gpiozero", "lgpio"]
+
+[project.scripts]
+adf5355 = "adf5355.entry:run"
+
+[tool.setuptools]
+packages = ["adf5355"]
+py-modules = ["adf5355_ladder"]

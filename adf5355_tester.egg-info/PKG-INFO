@@ -1,3 +1,13 @@
+Metadata-Version: 2.4
+Name: adf5355-tester
+Version: 0.1.0
+Summary: ADF5355 wideband synthesizer control for Raspberry Pi
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: spidev
+Requires-Dist: gpiozero
+Requires-Dist: lgpio
+
 # adf5355_tester
 
 ADF5355 wideband synthesizer (54 MHz – 13.6 GHz) driven from a Raspberry Pi.
@@ -43,37 +53,15 @@ Without MUXOUT wired (`--muxout-gpio -1`) the part is entirely open loop: writes
 cannot be confirmed, lock cannot be detected, and the only way to know the
 synthesizer did what you asked is to measure the RF output.
 
-## Install
-
-```bash
-uv tool install --editable ~/adf5355_tester
-```
-
-That puts an `adf5355` command on your PATH (`~/.local/bin`). Everything below
-works either as `adf5355 <cmd>` or, without installing, as
-`python3 -m adf5355 <cmd>` from the repository root.
-
 ## Usage
 
 ```bash
-adf5355 probe                                  # is the chip receiving writes?
-adf5355 dump   --freq 2.4G                     # registers, no hardware
-adf5355 set    --freq 2.4G --enable-rf --hold 5
-adf5355 dwell  --freq 2.4G --dwell 30 --enable-rf
-adf5355 ladder --enable-rf                     # duration-coded Ku-band pattern
-adf5355 sweep  --start 1G --stop 6G --points 51
-adf5355 off
+python3 -m adf5355 dump  --freq 2.4G          # registers, no hardware
+python3 -m adf5355 set   --freq 2.4G --enable-rf --hold 5
+python3 -m adf5355 set   --freq 11.7G --channel B --enable-rf
+python3 -m adf5355 sweep --start 1G --stop 6G --points 51
+python3 -m adf5355 off
 ```
-
-| Command | What it does |
-|---|---|
-| `probe` | Commands MUXOUT high then low and watches the GPIO follow — proves CE, CLK, DAT, LE and the chip's register decode end to end. The only readback this part has. |
-| `dump` | Solves a frequency and prints the full register image with every field named, plus the write order. Touches no hardware. |
-| `set` | Programs one frequency, optionally holding it with `--hold`. |
-| `dwell` | Transmits one frequency for `--dwell` seconds, then mutes and exits. |
-| `ladder` | Duration-coded ladder: rung *n* transmits for *n*×u seconds, so a burst's length identifies its frequency. |
-| `sweep` | Steps a range and checks lock at every point. Exits non-zero if any point fails. |
-| `off` | Disables both outputs. |
 
 This board's reference is **125.000 MHz** (marked `R125.000` on X1), and that
 is the `--ref-mhz` default, so the examples above omit it. Pass `--ref-mhz`
@@ -82,29 +70,6 @@ reason a sweep runs cleanly but never locks: the registers are computed against
 the assumed reference, so the VCO lands somewhere else entirely and only the
 points that happen to fall back inside 3.4-6.8 GHz will lock. If you see
 scattered `LOCK FAILED` lines with no frequency pattern, check this first.
-
-### The duration-coded ladder
-
-```bash
-adf5355 ladder --enable-rf                 # the guide's default pattern
-adf5355 ladder --start-ghz 8 --stop-ghz 9 --steps 4 --total-s 6
-adf5355 ladder --loops 3 --enable-rf
-```
-
-Rung *n* transmits for *n* × u seconds then stays quiet for *n* × u, where u is
-derived from `--total-s`, so every rung has a distinct burst length and the
-duration of a burst identifies which frequency produced it. The defaults
-reproduce `raspberry_pi_adf5355_ku_ladder_guide.pdf` exactly: nine carriers
-from 10.700 to 12.700 GHz over 18.000 s, where a 1.4 s burst is rung 7 and
-therefore 12.200 GHz.
-
-`ladder` defaults to `--channel B`, since 10.7-12.7 GHz is out of RFoutA's
-range. The next rung is programmed during the previous rung's OFF window, so
-retuning never eats into a coded ON window.
-
-The standalone `adf5355_ladder.py` remains as the original bench script;
-`tests/test_ladder_package_parity.py` asserts the two produce identical
-schedules.
 
 ### Output power
 

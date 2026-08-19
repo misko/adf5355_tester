@@ -1,0 +1,2 @@
+[console_scripts]
+adf5355 = adf5355.entry:run

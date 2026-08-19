@@ -62,7 +62,7 @@ class TestRfGate(unittest.TestCase):
     def _r6(self, argv):
         from adf5355 import Channel, plan
         args = cli.build_parser().parse_args(argv)
-        channel = Channel(args.channel)
+        channel = cli.resolve_channel(args)
         enable = args.enable_rf
         cfg = cli.build_config(args, enable and channel is Channel.A,
                                enable and channel is Channel.B)
@@ -120,7 +120,7 @@ class TestThreadExceptHook(unittest.TestCase):
     def _hook_module(self):
         # Import the entry point's helpers without executing main().
         import types, pathlib
-        src = pathlib.Path(context.ROOT, "adf5355", "__main__.py").read_text()
+        src = pathlib.Path(context.ROOT, "adf5355", "entry.py").read_text()
         src = src.split("threading.excepthook = _thread_excepthook")[0]
         ns = types.ModuleType("entry_helpers")
         exec(compile(src, "__main__.py", "exec"), ns.__dict__)
@@ -155,3 +155,37 @@ class TestThreadExceptHook(unittest.TestCase):
             self._args(FakeLgpioError, FakeLgpioError("GPIO busy"))))
         self.assertTrue(ns._is_lgpio_teardown_noise(
             self._args(FakeLgpioError, FakeLgpioError("unknown handle"))))
+
+
+class TestChannelDefaults(unittest.TestCase):
+    """argparse's set_defaults mutates the shared parent action in place.
+
+    Giving `ladder` a channel default that way silently changed the default for
+    every other subcommand, so `dump --freq 2.4G` started failing as RFoutB.
+    """
+
+    def test_ladder_defaults_to_b_without_contaminating_others(self):
+        parser = cli.build_parser()
+        ladder_args = parser.parse_args(["ladder"])
+        self.assertEqual(cli.resolve_channel(ladder_args).value, "B")
+        for argv in (["dump", "--freq", "2.4G"],
+                     ["set", "--freq", "2.4G"],
+                     ["dwell", "--freq", "2.4G"],
+                     ["sweep", "--start", "1G", "--stop", "2G"]):
+            with self.subTest(argv=argv[0]):
+                self.assertEqual(
+                    cli.resolve_channel(parser.parse_args(argv)).value, "A")
+
+    def test_parsing_ladder_first_does_not_change_later_parses(self):
+        parser = cli.build_parser()
+        parser.parse_args(["ladder"])
+        self.assertEqual(
+            cli.resolve_channel(parser.parse_args(["dump", "--freq", "2.4G"])).value,
+            "A")
+
+    def test_explicit_channel_always_wins(self):
+        parser = cli.build_parser()
+        self.assertEqual(cli.resolve_channel(
+            parser.parse_args(["ladder", "--channel", "A"])).value, "A")
+        self.assertEqual(cli.resolve_channel(
+            parser.parse_args(["dump", "--freq", "11.7G", "--channel", "B"])).value, "B")

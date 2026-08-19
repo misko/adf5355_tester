@@ -20,6 +20,9 @@ import time
 
 from .device import (DEFAULT_CE_GPIO, DEFAULT_MUXOUT_GPIO, DEFAULT_SPI_HZ,
                      ADF5355, LockTimeout)
+from .ladder import (make_ladder, format_ladder, run_ladder,
+                     overlaps_satellite_band, DEFAULT_START_HZ,
+                     DEFAULT_STOP_HZ, DEFAULT_STEPS, DEFAULT_TOTAL_S)
 from .plan import Channel, SynthConfig, plan
 from .registers import MuxOut, OutputPower
 
@@ -48,6 +51,11 @@ def parse_frequency(text: str) -> int:
         return round(float(text) * multiplier)
     except ValueError:
         raise argparse.ArgumentTypeError(f"cannot parse frequency {text!r}")
+
+
+def resolve_channel(args) -> Channel:
+    """Explicit --channel wins; otherwise the subcommand's own fallback."""
+    return Channel(args.channel or getattr(args, "channel_default", "A"))
 
 
 def build_config(args, outa: bool, outb: bool) -> SynthConfig:
@@ -95,7 +103,7 @@ def report_lock(dev: ADF5355, args) -> bool:
 
 
 def cmd_dump(args) -> int:
-    channel = Channel(args.channel)
+    channel = resolve_channel(args)
     # Mirror the RF gate exactly: dump exists to preview the bytes that would
     # actually be written, so showing an output enabled when it would not be
     # defeats the point.
@@ -119,7 +127,7 @@ def cmd_dump(args) -> int:
 
 
 def cmd_set(args) -> int:
-    channel = Channel(args.channel)
+    channel = resolve_channel(args)
     enable = args.enable_rf
     config = build_config(args, enable and channel is Channel.A,
                           enable and channel is Channel.B)
@@ -148,7 +156,7 @@ def cmd_set(args) -> int:
 
 def cmd_dwell(args) -> int:
     """Hold one frequency for a fixed time, then mute and exit."""
-    channel = Channel(args.channel)
+    channel = resolve_channel(args)
     enable = args.enable_rf
     config = build_config(args, enable and channel is Channel.A,
                           enable and channel is Channel.B)
@@ -182,8 +190,67 @@ def cmd_dwell(args) -> int:
     return 0
 
 
+def cmd_ladder(args) -> int:
+    """Duration-coded ladder: rung n transmits for n*u, then is quiet for n*u."""
+    channel = resolve_channel(args)
+    enable = args.enable_rf
+    try:
+        steps = make_ladder(round(args.start_ghz * 1e9),
+                            round(args.stop_ghz * 1e9),
+                            args.steps, args.total_s)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    config = build_config(args, enable and channel is Channel.A,
+                          enable and channel is Channel.B)
+    # Validate every rung up front: the per-frequency band check would
+    # otherwise only fire once the ladder was already running.
+    for step in steps:
+        try:
+            plan(config, step.freq_hz, channel)
+        except ValueError as exc:
+            print(f"error: rung {step.index} ({step.freq_hz/1e9:.3f} GHz): {exc}",
+                  file=sys.stderr)
+            return 2
+
+    print(format_ladder(steps))
+    if overlaps_satellite_band(steps):
+        print("\nSAFETY: this range overlaps the 10.7-12.7 GHz satellite "
+              "downlink band. Use a shielded, attenuated path; do not radiate.")
+    else:
+        print("\nSAFETY: bench equipment. Do not connect an antenna.")
+
+    if not enable:
+        print("\nRF disabled, so nothing was transmitted. Re-run with "
+              "--enable-rf into a shielded/attenuated path.")
+        return 0
+
+    def check(dev, step):
+        if not dev.can_detect_lock:
+            return True
+        try:
+            dev.wait_for_lock(args.lock_timeout)
+            return True
+        except LockTimeout:
+            print(f"  rung {step.index}: LOCK FAILED", file=sys.stderr)
+            return False
+
+    dev = open_device(args, config)
+    try:
+        failures = run_ladder(dev, steps, channel, args.loops,
+                              None if args.no_lock_check else check)
+    finally:
+        dev.close()
+    if failures:
+        print(f"\n{failures} rung(s) failed to lock", file=sys.stderr)
+        return 1
+    print("\nladder complete; output muted")
+    return 0
+
+
 def cmd_sweep(args) -> int:
-    channel = Channel(args.channel)
+    channel = resolve_channel(args)
     config = build_config(args, args.enable_rf and channel is Channel.A,
                           args.enable_rf and channel is Channel.B)
     if args.points < 2:
@@ -272,9 +339,10 @@ def build_parser() -> argparse.ArgumentParser:
                         choices=[0, 1, 2, 3],
                         help=f"RFoutA power: 0=-4 1=-1 2=+2 3=+5 dBm "
                              f"(default {DEFAULT_POWER}, the lowest setting)")
-    common.add_argument("--channel", default="A", choices=["A", "B"],
+    common.add_argument("--channel", default=None, choices=["A", "B"],
                         help="A = VCO/2**d (53.125 MHz-6.8 GHz), "
-                             "B = doubler (6.8-13.6 GHz)")
+                             "B = doubler (6.8-13.6 GHz). Defaults to A, "
+                             "except ladder which defaults to B")
     common.add_argument("--solver", default="adi", choices=["adi", "exact"])
     common.add_argument("--no-mute-till-lock", action="store_true")
     common.add_argument("--no-negative-bleed", action="store_true")
@@ -329,6 +397,24 @@ def build_parser() -> argparse.ArgumentParser:
                     help="seconds to transmit before muting and exiting "
                          "(default 10)")
     dw.set_defaults(func=cmd_dwell)
+
+    lad = sub.add_parser("ladder", parents=[common],
+                         help="duration-coded ladder: rung n transmits for "
+                              "n*u seconds, so burst length identifies the rung")
+    lad.add_argument("--start-ghz", type=float, default=DEFAULT_START_HZ / 1e9,
+                     help=f"first rung in GHz (default "
+                          f"{DEFAULT_START_HZ / 1e9:g})")
+    lad.add_argument("--stop-ghz", type=float, default=DEFAULT_STOP_HZ / 1e9,
+                     help=f"last rung in GHz (default {DEFAULT_STOP_HZ / 1e9:g})")
+    lad.add_argument("--steps", type=int, default=DEFAULT_STEPS,
+                     help=f"number of rungs (default {DEFAULT_STEPS})")
+    lad.add_argument("--total-s", type=float, default=DEFAULT_TOTAL_S,
+                     help=f"total coded interval in seconds (default "
+                          f"{DEFAULT_TOTAL_S:g})")
+    lad.add_argument("--loops", type=int, default=1,
+                     help="number of complete ladders to run (default 1)")
+    # The guide's pattern is RFoutB; 10.7-12.7 GHz is out of RFoutA's range.
+    lad.set_defaults(func=cmd_ladder, channel_default="B")
 
     w = sub.add_parser("sweep", parents=[common],
                        help="step across a range, checking lock at each point")

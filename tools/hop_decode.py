@@ -1763,7 +1763,8 @@ def write_int16(path, samples: np.ndarray, scale: float = 2000.0) -> int:
 def capture_from_pluto(path: Path, *, uri: str, if_hz: float, fs: float,
                        seconds: float, gain: float,
                        nbuf: int = DEFAULT_NBUF,
-                       bw: float | None = None) -> tuple[int, float]:
+                       bw: float | None = None,
+                       gain_mode: str = "manual") -> tuple[int, float]:
     """Stream int16 I/Q straight to disk. Returns (samples, elapsed seconds).
 
     Capture only -- no analysis in the loop -- because anything else falls
@@ -1776,8 +1777,9 @@ def capture_from_pluto(path: Path, *, uri: str, if_hz: float, fs: float,
     sdr = adi.Pluto(uri=uri)
     sdr.sample_rate = int(fs)
     sdr.rx_rf_bandwidth = int(rx_bandwidth_for(fs, bw))
-    sdr.gain_control_mode_chan0 = "manual"
-    sdr.rx_hardwaregain_chan0 = gain
+    sdr.gain_control_mode_chan0 = gain_mode
+    if gain_mode == "manual":
+        sdr.rx_hardwaregain_chan0 = gain
     sdr.rx_lo = int(if_hz)
     sdr.rx_destroy_buffer()
     sdr.rx_buffer_size = nbuf
@@ -1827,7 +1829,8 @@ def rx_bandwidth_for(fs: float, override: float | None = None) -> float:
 
 def capture_single_shot(path: Path, *, uri: str, if_hz: float, fs: float,
                         seconds: float, gain: float,
-                        bw: float | None = None) -> tuple[int, float]:
+                        bw: float | None = None,
+                        gain_mode: str = "manual") -> tuple[int, float]:
     """Capture the whole run as ONE hardware buffer. Returns (samples, seconds).
 
     The streaming path above issues repeated rx() calls, and above roughly
@@ -1847,8 +1850,9 @@ def capture_single_shot(path: Path, *, uri: str, if_hz: float, fs: float,
     sdr = adi.Pluto(uri=uri)
     sdr.sample_rate = int(fs)
     sdr.rx_rf_bandwidth = int(rx_bandwidth_for(fs, bw))
-    sdr.gain_control_mode_chan0 = "manual"
-    sdr.rx_hardwaregain_chan0 = gain
+    sdr.gain_control_mode_chan0 = gain_mode
+    if gain_mode == "manual":
+        sdr.rx_hardwaregain_chan0 = gain
     sdr.rx_lo = int(if_hz)
     sdr.rx_destroy_buffer()
     sdr._rxadc.set_kernel_buffers_count(1)
@@ -2036,6 +2040,12 @@ def build_parser() -> argparse.ArgumentParser:
                          "drops samples if the host falls behind")
     rx.add_argument("--rx-bw", type=float, default=None,
                     help="analog RX bandwidth in Hz (default 80%% of --fs)")
+    rx.add_argument("--gain-mode",
+                    choices=("manual", "slow_attack", "fast_attack", "hybrid"),
+                    default="manual",
+                    help="AGC mode; --gain applies only to manual. slow_attack "
+                         "suits a comb whose tones hop across a wide span, "
+                         "where one fixed gain cannot suit every point")
 
     an = p.add_argument_group("analysis")
     an.add_argument("--capture", default=None,
@@ -2175,7 +2185,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.capture_mode == "single":
             count, elapsed = capture_single_shot(
                 Path(out), uri=args.uri, if_hz=centre, fs=args.fs,
-                seconds=args.seconds, gain=args.gain, bw=args.rx_bw)
+                seconds=args.seconds, gain=args.gain, bw=args.rx_bw,
+                gain_mode=args.gain_mode)
             print(f"  captured {count} samples as one contiguous buffer "
                   f"({count/args.fs*1e3:.1f} ms of signal, read out in "
                   f"{elapsed:.2f} s)")
@@ -2184,7 +2195,7 @@ def main(argv: list[str] | None = None) -> int:
             count, elapsed = capture_from_pluto(
                 Path(out), uri=args.uri, if_hz=centre, fs=args.fs,
                 seconds=args.seconds, gain=args.gain, nbuf=args.nbuf,
-                bw=args.rx_bw)
+                bw=args.rx_bw, gain_mode=args.gain_mode)
             live = count / args.fs / elapsed
             print(f"  captured {count} samples in {elapsed:.2f} s "
                   f"({live*100:.1f}% of real time)")

@@ -79,6 +79,10 @@ class ADF5355:
         self._muxout = None
         self._synced = False
         self._current: Plan | None = None
+        # Explicit mute survives a retune.  Without this, program()/retune()
+        # write R6 straight from the new plan -- whose enable bits reflect the
+        # configuration, not the live state -- and silently re-key the output.
+        self._muted = False
         self.trace: list[WriteRecord] = []
 
     # --- resource management ------------------------------------------------
@@ -126,7 +130,15 @@ class ADF5355:
         self.close()
 
     # --- low level ----------------------------------------------------------
+    def _apply_mute(self, reg: int, word: int) -> int:
+        """Force both outputs off in an R6 word while an explicit mute holds."""
+        if reg != 6 or not self._muted:
+            return word
+        word &= ~_OUTA_ENABLE.mask
+        return word | _OUTB_DISABLE.encode(1)
+
     def _write(self, reg: int, word: int) -> None:
+        word = self._apply_mute(reg, word)
         word = (word | (reg & 0xF)) & 0xFFFFFFFF
         self.trace.append(WriteRecord(reg, word))
         if self.dry_run or self._spi is None:
@@ -199,7 +211,12 @@ class ADF5355:
         self._write(6, word)
 
     def set_output(self, channel: Channel, enabled: bool) -> None:
-        """Gate an output without disturbing the loop."""
+        """Gate an output without disturbing the loop.
+
+        Enabling clears the sticky mute; disabling sets it, so a subsequent
+        retune cannot bring the output back up behind the caller's back.
+        """
+        self._muted = not enabled
         if channel is Channel.B:
             # DB10 is active-low: 0 enables RFoutB.
             def mutate(w):
@@ -211,6 +228,7 @@ class ADF5355:
 
     def mute(self) -> None:
         """Disable both outputs.  Safe to call when nothing is programmed."""
+        self._muted = True
         if self._current is None:
             return
         word = self._current.words[6]

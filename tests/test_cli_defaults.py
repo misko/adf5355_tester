@@ -239,3 +239,44 @@ class TestNoSharedDefaultMutation(unittest.TestCase):
         cfg = cli.build_config(cfg_args, True, False)
         for channel in (Channel.A, Channel.B):
             plan(cfg, 6_800_000_000, channel)   # both must be constructible
+
+
+class TestEverySubcommandBuilds(unittest.TestCase):
+    """`off` shipped broken because a refactor missed one call site.
+
+    Every subcommand must parse, resolve a channel, and build a config without
+    hardware -- the cheapest check that catches a missed rename.
+    """
+
+    ARGV = {
+        "probe": [],
+        "dump": ["--freq", "2.4G"],
+        "set": ["--freq", "2.4G"],
+        "dwell": ["--freq", "2.4G"],
+        "ladder": [],
+        "sweep": ["--start", "1G", "--stop", "2G"],
+        "off": [],
+    }
+
+    def test_all_subcommands_are_covered_by_this_test(self):
+        parser = cli.build_parser()
+        subs = next(a for a in parser._actions
+                    if hasattr(a, "choices") and isinstance(a.choices, dict))
+        self.assertEqual(set(subs.choices), set(self.ARGV),
+                         "a subcommand was added without a smoke case here")
+
+    def test_each_subcommand_resolves_a_channel_and_builds_a_config(self):
+        from adf5355 import Channel, plan
+        parser = cli.build_parser()
+        for name, extra in self.ARGV.items():
+            with self.subTest(command=name):
+                args = parser.parse_args([name] + extra)
+                channel = cli.resolve_channel(args)
+                self.assertIn(channel, (Channel.A, Channel.B))
+                cfg = cli.build_config(args, False, False)
+                freq = getattr(args, "freq", None)
+                if freq is None:
+                    freq = getattr(args, "start", None) or 2_400_000_000
+                    if channel is Channel.B:
+                        freq = 11_700_000_000
+                plan(cfg, freq, channel)

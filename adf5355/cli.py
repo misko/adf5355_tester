@@ -287,7 +287,7 @@ def cmd_off(args) -> int:
     config = build_config(args, False, False)
     dev = open_device(args, config)
     try:
-        dev.program(plan(config, args.freq, Channel(args.channel)))
+        dev.program(plan(config, args.freq, resolve_channel(args)))
         dev.mute()
         print("outputs disabled")
     finally:

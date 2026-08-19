@@ -1,9 +1,12 @@
 """Command line front end.
 
-    python3 -m adf5355 dump  --ref-mhz 10 --freq 2.4G
-    python3 -m adf5355 set   --ref-mhz 10 --freq 11.7G --channel B --enable-rf
-    python3 -m adf5355 sweep --ref-mhz 10 --start 1G --stop 6G --points 51
-    python3 -m adf5355 off   --ref-mhz 10
+    python3 -m adf5355 dump  --freq 2.4G
+    python3 -m adf5355 set   --freq 11.7G --channel B --enable-rf
+    python3 -m adf5355 sweep --start 1G --stop 6G --points 51
+    python3 -m adf5355 off
+
+--ref-mhz defaults to this board's 125 MHz reference; pass it explicitly for
+any board whose X1 is marked otherwise.
 
 RF is never enabled without --enable-rf.
 """
@@ -18,6 +21,9 @@ from .device import (DEFAULT_CE_GPIO, DEFAULT_MUXOUT_GPIO, DEFAULT_SPI_HZ,
                      ADF5355, LockTimeout)
 from .plan import Channel, SynthConfig, plan
 from .registers import MuxOut, OutputPower
+
+# X1 on this board is marked R125.000.  Overridable, never guessed.
+DEFAULT_REF_MHZ = 125.0
 
 _SUFFIXES = {"k": 1e3, "m": 1e6, "g": 1e9}
 
@@ -193,9 +199,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="adf5355", description="ADF5355 synthesizer control")
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--ref-mhz", type=float, required=True,
-                        help="actual REFIN frequency on your board, in MHz "
-                             "(required -- clone boards differ; do not guess)")
+    common.add_argument("--ref-mhz", type=float, default=DEFAULT_REF_MHZ,
+                        help=f"actual REFIN frequency on your board, in MHz "
+                             f"(default {DEFAULT_REF_MHZ:g}, this board's X1). "
+                             f"Clone boards differ -- read the marking rather "
+                             f"than assuming")
     common.add_argument("--ref-doubler", action="store_true")
     common.add_argument("--ref-div2", action="store_true")
     common.add_argument("--ref-diff", action="store_true",

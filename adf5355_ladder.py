@@ -48,6 +48,7 @@ MIN_INT_PRESCALER_89 = 75
 # Pinned defaults: the pattern documented in the guide PDF. Changing any of
 # these changes what the guide describes, so they are named rather than typed
 # twice (make_ladder signature and argparse both use them).
+DEFAULT_REF_MHZ = 125.0  # X1 is marked R125.000
 DEFAULT_START_HZ = 10_700_000_000
 DEFAULT_STOP_HZ = 12_700_000_000
 DEFAULT_STEPS = 9
@@ -707,8 +708,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--ref-mhz",
         type=float,
-        required=True,
-        help="Actual reference oscillator frequency on your board in MHz (required)",
+        default=DEFAULT_REF_MHZ,
+        help=(
+            f"Reference oscillator frequency on your board in MHz "
+            f"(default {DEFAULT_REF_MHZ:g}, this board's X1 marking). "
+            f"Clone boards ship different oscillators; read X1 rather than "
+            f"assuming, because a wrong value still computes clean registers "
+            f"and simply fails to lock."
+        ),
     )
     p.add_argument("--cp-ua", type=int, default=900, help="Charge-pump current in uA (default 900)")
     p.add_argument("--bus", type=int, default=0, help="SPI bus (default 0)")

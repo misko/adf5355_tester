@@ -36,7 +36,7 @@ levels, so commanding it high and then low and watching the GPIO follow proves
 the entire chain — CE, CLK, DAT, LE and the chip's own register decode:
 
 ```bash
-python3 -m adf5355 probe --ref-mhz 125
+python3 -m adf5355 probe
 ```
 
 Without MUXOUT wired (`--muxout-gpio -1`) the part is entirely open loop: writes
@@ -46,15 +46,16 @@ synthesizer did what you asked is to measure the RF output.
 ## Usage
 
 ```bash
-python3 -m adf5355 dump  --ref-mhz 125 --freq 2.4G          # registers, no hardware
-python3 -m adf5355 set   --ref-mhz 125 --freq 2.4G --enable-rf --hold 5
-python3 -m adf5355 set   --ref-mhz 125 --freq 11.7G --channel B --enable-rf
-python3 -m adf5355 sweep --ref-mhz 125 --start 1G --stop 6G --points 51
-python3 -m adf5355 off   --ref-mhz 125
+python3 -m adf5355 dump  --freq 2.4G          # registers, no hardware
+python3 -m adf5355 set   --freq 2.4G --enable-rf --hold 5
+python3 -m adf5355 set   --freq 11.7G --channel B --enable-rf
+python3 -m adf5355 sweep --start 1G --stop 6G --points 51
+python3 -m adf5355 off
 ```
 
-This board's reference is **125.000 MHz** (marked `R125.000` on X1), which is
-what the examples above use. Passing the wrong value is the single most likely
+This board's reference is **125.000 MHz** (marked `R125.000` on X1), and that
+is the `--ref-mhz` default, so the examples above omit it. Pass `--ref-mhz`
+explicitly for any board whose X1 is marked otherwise. Passing the wrong value is the single most likely
 reason a sweep runs cleanly but never locks: the registers are computed against
 the assumed reference, so the VCO lands somewhere else entirely and only the
 points that happen to fall back inside 3.4-6.8 GHz will lock. If you see
@@ -147,8 +148,8 @@ in `raspberry_pi_adf5355_ku_ladder_guide.pdf`, so a run with no range arguments
 is byte-for-byte the same ladder as before.
 
 ```bash
-python3 adf5355_ladder.py --ref-mhz 125 --dry-run
-python3 adf5355_ladder.py --ref-mhz 125 --start-ghz 8.0 --stop-ghz 9.0 \
+python3 adf5355_ladder.py --dry-run
+python3 adf5355_ladder.py --start-ghz 8.0 --stop-ghz 9.0 \
                           --steps 5 --total-s 6 --dry-run
 ```
 

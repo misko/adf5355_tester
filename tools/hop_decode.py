@@ -1802,6 +1802,15 @@ def capture_from_pluto(path: Path, *, uri: str, if_hz: float, fs: float,
 RX_BW_MIN_HZ = 200e3
 RX_BW_MAX_HZ = 20e6
 
+# The device serves a single-shot buffer out of its CMA pool, which is 64 MiB
+# in total. A request anywhere near that only succeeds against a nearly
+# unfragmented pool, and when it fails it does not fail cleanly: the data path
+# wedges and every subsequent client -- any size, any rate -- times out until
+# iiod is restarted on the device. Half the pool is the largest request that
+# has been reliable here, so refuse above it rather than roll the dice and
+# take the radio down. See pluto-plus-utils#27.
+MAX_SINGLE_SHOT_SAMPLES = 8_388_608                        # 32 MiB at 4 B/sample
+
 
 def rx_bandwidth_for(fs: float, override: float | None = None) -> float:
     """Analog RX bandwidth to pair with a sample rate.
@@ -1845,6 +1854,15 @@ def capture_single_shot(path: Path, *, uri: str, if_hz: float, fs: float,
     sdr._rxadc.set_kernel_buffers_count(1)
 
     want = int(seconds * fs)
+    if want > MAX_SINGLE_SHOT_SAMPLES:
+        raise ValueError(
+            f"single-shot capture of {want} samples "
+            f"({want * 4 / 2**20:.0f} MiB) exceeds the safe ceiling of "
+            f"{MAX_SINGLE_SHOT_SAMPLES} ({MAX_SINGLE_SHOT_SAMPLES * 4 / 2**20:.0f} MiB); "
+            f"buffers this large wedge the device data path until iiod is "
+            f"restarted. Use a lower --fs, a shorter --seconds "
+            f"(<= {MAX_SINGLE_SHOT_SAMPLES / fs:.2f} s at {fs/1e6:g} MS/s), "
+            f"or --capture-mode stream.")
     sdr.rx_buffer_size = want
     started = time.monotonic()
     block = np.asarray(sdr.rx())

@@ -262,8 +262,21 @@ the confidence gate.
 From one period upward, nothing improves with more capture. Point-to-point
 spread sits at 56–71 Hz across a 320-fold range of listen time. If it were
 noise-limited it would fall as the square root of time and 32 s would beat
-0.2 s by twelvefold; it does not move at all, so **~60 Hz is a systematic floor**
-— per-slot receiver bias, which no amount of integration touches.
+0.2 s by twelvefold; it does not move at all, so **~60 Hz was a systematic
+floor**.
+
+**That floor has since been identified and removed, and it was ours.** It was
+not receiver bias: it was the decoder fitting a parabola through three
+log-magnitude bins of a Hann-windowed frame, which is a biased fit whose error
+is a fixed function of where the tone sits inside its bin. Every point sits at
+its own fixed fractional bin position, so every point collected its own fixed
+error — the same error in every frame, of every visit, of every capture, which
+is exactly why averaging never touched it. Reproduced with **no noise at all**,
+the twenty points of the standard plan spread by **58 Hz sd**, against the
+56–71 Hz the bench measured. See
+[Measuring each point](#measuring-each-point-the-estimator) below; the
+whole-dwell estimator that replaced it spreads by **0.038 Hz** on the same
+input, and it does fall with listen time.
 
 Two things get worse with longer captures. Decode cost scales linearly, about
 2.7x the listen time, so 32 s of signal costs 85 s to decode. And the LNB drifts
@@ -324,7 +337,7 @@ Two things fall out of the dwell table:
 
 | Setting | Value | Why |
 |---|---|---|
-| dwell | fixed 10 ms | best measured precision, 730 Hz sd |
+| dwell | fixed 10 ms | precision goes as dwell^1.5; 0.038 Hz sd at 10 dB |
 | points | 20 | 20/20 recovered; 40 also works |
 | span | 11.000000 → 11.001710 GHz | 1.71 MHz, 90 kHz spacing |
 | seed | `0xC0FFEE` | the entire agreement between the two ends |
@@ -365,12 +378,127 @@ runs five steps:
    permutations — scoring each shift by the mean envelope of the point the
    schedule expects in each frame. That bounds the search at 200 ms instead of
    the length of the run.
-5. **Measure.** Per point, the median interpolated peak frequency over the frames
-   the schedule assigns to it, keeping only frames that stand clear of that
-   point's own noise floor. The frequency error is measured minus nominal IF.
+5. **Measure.** Per point, fit each whole dwell coherently and combine the
+   dwells. The frequency error is measured minus nominal IF. This step is
+   selectable and is the subject of the next section.
 
 The schedule itself is imported from `adf5355.hopper` — the same generator the
 transmitter runs — so the two ends cannot drift apart.
+
+### Measuring each point: the estimator
+
+Steps 1–4 find and label the signal, and they are good at it. They are a poor
+way to measure a *frequency*, and the reason is not noise.
+
+`--estimator peak` is the original: the interpolated FFT peak of each frame,
+then the median over the frames the schedule assigns to that point. Its error is
+**bias, not noise** — see above — so it is flat at ~58 Hz whatever the SNR,
+whatever the dwell, and however long you listen:
+
+| per-sample SNR | −10 dB | 0 dB | 10 dB | 20 dB | 30 dB | 40 dB |
+|---|---:|---:|---:|---:|---:|---:|
+| `peak`, one dwell | 98.2 | 65.9 | 59.3 | 57.8 | 58.8 | 58.7 |
+| `ml`, one dwell | **0.82** | **0.24** | **0.087** | **0.026** | **0.0079** | **0.0023** |
+| Cramér–Rao bound | 0.78 | 0.25 | 0.078 | 0.025 | 0.0078 | 0.0025 |
+
+*rms error in Hz on one 10 ms dwell, 200 trials per cell.*
+
+`--estimator ml` (the default) does the only thing that helps: it stops
+estimating frequency from a framed spectrogram. Within one dwell the transmitter
+emits a clean CW tone of known start and length, so the whole dwell is used at
+once —
+
+1. mix the dwell down by the coarse frequency the comb search already
+   established, so the residual sits near DC;
+2. boxcar-decimate by 32. A boxcar is linear phase, so it shifts the time origin
+   and nothing else and cannot bias a frequency estimate; it costs no Fisher
+   information and makes the fit 32× cheaper;
+3. find the periodogram maximum, which for one tone in white Gaussian noise *is*
+   the maximum-likelihood estimate, and Newton onto it exactly.
+
+Measured at **1.010× the Cramér–Rao bound** from −5 dB to 20 dB per sample.
+There is nothing material left on the table: the bound is what no estimator can
+beat, and this one is within one percent of it.
+
+Other estimators are selectable for comparison — `zeropad` (indistinguishable
+from `ml`), `jacobsen` (1.5× the bound), `kay` and `phase-slope` (equal to `ml`
+above 0 dB, and they collapse below it, which is why neither is the default).
+
+**Guards matter.** The synthesiser retunes *into* the start of each dwell, so
+the first millisecond or so is a settling chirp rather than a tone, and a
+coherent fit over the whole dwell has no median to spit that out for it.
+`--guard-start-ms` (default 1.5) and `--guard-end-ms` (default 0.2) trim the
+head and tail; precision goes as the 3/2 power of what is left, so the trim is
+cheap. The run does not ask you to take the guard on trust — it fits each half
+of every dwell separately and reports what they disagree by, which is zero for a
+clean tone and grows with anything that is not one:
+
+| head guard | 0 ms | 0.5 ms | 1.5 ms | 3.0 ms |
+|---|---:|---:|---:|---:|
+| residual bias | +7.71 Hz | +6.39 Hz | +0.71 Hz | +0.02 Hz |
+| reported half-split | +38.8 Hz | +24.1 Hz | +2.54 Hz | +0.09 Hz |
+
+*against a 1.2 ms, 2 kHz settling chirp. Raise the guard until the half-split
+comes back to zero.*
+
+**The LNB's drift is fitted out.** The LO walks about 4.5 Hz/s, and because the
+schedule repeats, each point is always visited at the same phase of the period —
+so the drift lands on each point as a *fixed* offset that a longer capture does
+not average away. One drift rate, common to every point, is fitted across every
+visit at once and removed; `--no-drift-fit` turns it off. On a 4 s capture with
+4.5 Hz/s injected, the fit recovers 4.499 Hz/s and takes the spread from
+0.244 Hz to 0.0069 Hz.
+
+**Visits are combined incoherently, and that is not a compromise.** Each point
+is visited many times per capture, and the visits are averaged by inverse
+variance — a mean, not a median, which is 1.28× tighter for exactly the textbook
+reason. Combining them *coherently* would be worth vastly more: precision would
+grow with the 3/2 power of the whole capture span instead of the square root of
+the visit count, measured here at 150× better. It is not available:
+
+| transmitter phase | LNB drift | measured coherence | random-phase null | verdict |
+|---|---:|---:|---:|---|
+| free-running | 0 Hz/s | 0.999 | 0.278 | coherent — 0.00004 Hz |
+| relocks each visit | 0 Hz/s | 0.191 | 0.278 | **not coherent** |
+| free-running | 4.5 Hz/s | 0.144 | 0.278 | **not coherent** |
+
+A synthesiser that retunes away and relocks has no memory of where its phase
+was, which is the second row. And the third row is the one that closes the
+door: phase is the integral of frequency, so a drifting LO puts a *quadratic*
+phase across the capture that no single common frequency can absorb — even a
+perfectly coherent transmitter is not coherent through this LNB. Coherent
+combination is unavailable twice over.
+
+**Every one of those numbers was measured on synthetic signals, and no operator
+has to take them on trust.** The visit weights are inverse variances taken
+straight from the Cramér–Rao bound, so the bound's prediction for the actual SNR
+and dwell of the actual capture falls out for free, and each run prints what it
+really achieved beside it:
+
+```
+  vs the bound : 0.97x the Cramer-Rao limit for this SNR and dwell
+```
+
+1.0 means there is nothing left on the table. A large number means the visits of
+one point disagree by more than noise can explain — something unmodelled is
+moving, the quoted precision is not the accuracy, and the run says so and fails.
+Injecting an unfitted 4.5 Hz/s drift reads **166×** and warns; fitting it out
+reads **1.02×** and does not. The ratio is withheld below eight visits per
+point, where a standard error is itself too uncertain to mean anything, and the
+standard errors are corrected for the small-sample bias of a sample deviation
+(*c₄*) — without that correction five visits read 0.7× and would look like
+beating a bound that cannot be beaten.
+
+`--combine coherent` implements it anyway, because a claim that a technique does
+not apply is worth nothing unless the same code can be shown working when it
+does. It is gated on the measured coherence clearing a random-phase null
+computed from the same magnitudes at the same times, and the gate is decided
+once over all twenty points rather than per point — a per-point test lets one
+point in twenty through by chance, and one point combined coherently when it
+should not be lands a whole hertz out and ruins the spread the other nineteen
+just earned. On incoherent input it does not degrade gracefully; it locks onto
+the wrong lobe of the 1/period comb and returns a confident answer 30–90× worse
+than the average it replaced. Hence the gate, and hence the default.
 
 ### Reading the confidence figures
 
@@ -792,7 +920,7 @@ the residual is real rather than a float artifact.
 python3 -m unittest discover -s tests -t .
 ```
 
-161 tests, no hardware required — including the hop decoder, which is exercised
+238 tests, no hardware required — including the hop decoder, which is exercised
 against synthetic captures carrying a planted comb offset and a planted epoch.
 The register images are checked three ways:
 
@@ -811,9 +939,22 @@ Two more guard the calibration rather than the registers:
 
 4. **`tests/test_hop_decode.py`** — synthesises the capture a perfect receiver
    would have taken, then asserts the decoder recovers the planted offset to
-   within a fraction of a bin, the planted epoch to within a frame, and every
-   point; and that a wrong seed or pure noise is reported as untrustworthy
-   rather than measured.
+   within **one hertz at every point**, the planted epoch to within a frame,
+   and every point; and that a wrong seed or pure noise is reported as
+   untrustworthy rather than measured.
+
+   The estimator is held to its own account there. The old estimator's floor is
+   shown to be *bias* by measuring it with no noise present at all, and shown to
+   be unmovable by measuring the same tone from frames at different phases and
+   asserting the answer agrees to six decimals. The new one is asserted to reach
+   the Cramér–Rao bound — within 25% of it, and a test fails if it ever comes in
+   *below* the bound, because that means a bug rather than a triumph — and to
+   beat the old one by more than a hundredfold on byte-identical input. The
+   synthesiser models what the hardware does rather than what would be
+   convenient: independent phase per visit by default, because a PLL that
+   retunes away relocks with no memory of its phase, with the coherent
+   alternative available so that the technique it would unlock can be shown
+   working and then shown unavailable.
 5. **`tests/test_script_defaults.py`** — parses `adf5355_rf_hop.sh` and
    `sdr_listen.sh` and asserts every shared setting matches, that each is
    actually passed through to the tool it drives, and that both agree with the

@@ -27,9 +27,14 @@ The steps, in order:
    permutations -- scoring each shift by the mean envelope dB of the point the
    schedule expects in each frame. ``epoch_sigma`` is how far the winner stands
    above the rest of that search, in standard deviations.
-5. **Measure.** Per point, the median interpolated peak frequency over the
-   frames the schedule assigns to it, keeping only frames whose envelope stands
-   clear of that point's own noise floor.
+5. **Measure.** Per point, fit each whole dwell coherently -- mix it down by
+   the coarse frequency, decimate, and take the maximum-likelihood periodogram
+   peak -- then combine that point's dwells by inverse variance. Selectable:
+   ``--estimator peak`` is the original framed FFT peak with a median over
+   frames, kept because the improvement is worth being able to reproduce rather
+   than assert. The framed estimator's error is a fixed per-point interpolation
+   bias of tens of hertz that no amount of listening removes; the whole-dwell
+   fit reaches the Cramer-Rao bound and is about 1500x tighter.
 
 A confident wrong answer is the failure that matters here, so both confidence
 figures are printed every time. Anything the run flags -- a floor missed, a
@@ -53,6 +58,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -146,6 +152,25 @@ class Capture:
         return self._samples[start * self.frame:
                              (start + n) * self.frame].reshape(n, self.frame)
 
+    @property
+    def nsamples(self) -> int:
+        return self.nframes * self.frame
+
+    def samples(self, start: int, count: int) -> np.ndarray:
+        """``count`` complex samples from sample index ``start``.
+
+        Frame-free access, because the fine estimator works on whole dwells
+        rather than on the framing grid the envelope search uses.
+        """
+        start = max(0, int(start))
+        stop = min(self.nsamples, start + max(0, int(count)))
+        if stop <= start:
+            return np.empty(0, dtype=np.complex64)
+        if self._raw is not None:
+            flat = np.asarray(self._raw[start * 2:stop * 2]).astype(np.float32)
+            return flat[0::2] + 1j * flat[1::2]
+        return self._samples[start:stop]
+
 
 def frame_bins(frame: int, fs: float, centre_hz: float) -> np.ndarray:
     """Absolute frequency of each FFT bin, fftshifted so it ascends."""
@@ -221,13 +246,16 @@ def point_slots(fbins: np.ndarray, if_nom: np.ndarray, offset_hz: float,
 
 
 def point_envelopes(capture: Capture, window: np.ndarray, fbins: np.ndarray,
-                    slots: list[tuple[int, int]]
+                    slots: list[tuple[int, int]], want_peak: bool = True
                     ) -> tuple[np.ndarray, np.ndarray]:
     """Per point and frame: peak power in the slot, and where that peak sits.
 
     The frequency is refined by a parabola through the log magnitudes either
     side of the winning bin, which is worth roughly two orders of magnitude
-    against the raw bin width.
+    against the raw bin width -- and which is also the source of the fixed
+    per-point bias that the whole-dwell estimator exists to escape. With
+    ``want_peak`` false only the envelope is built, which is all the epoch
+    alignment needs and skips that arithmetic entirely.
     """
     npoints, nframes = len(slots), capture.nframes
     env = np.zeros((npoints, nframes), dtype=np.float32)
@@ -243,6 +271,8 @@ def point_envelopes(capture: Capture, window: np.ndarray, fbins: np.ndarray,
             segment = power[:, lo:hi]
             k = lo + np.argmax(segment, axis=1)
             env[p, start:start + n] = power[rows, k]
+            if not want_peak:
+                continue
             mid = np.clip(k, 1, last - 1)
             a = np.log(power[rows, mid - 1] + 1e-30)
             b = np.log(power[rows, mid] + 1e-30)
@@ -334,6 +364,14 @@ class PointResult:
     frames_used: int
     frames_assigned: int
     envelope_db: float
+    # Filled in by the whole-dwell estimator only; the framed one has no
+    # notion of a visit and no honest standard error to report.
+    visits_used: int = 0
+    visits_total: int = 0
+    stderr_hz: float = float("nan")
+    crb_hz: float = float("nan")      # what the Cramer-Rao bound allows
+    coherence: float = float("nan")
+    coherence_null: float = float("nan")
 
 
 def measure_points(env_db: np.ndarray, peak: np.ndarray, assigned: np.ndarray,
@@ -363,6 +401,630 @@ def measure_points(env_db: np.ndarray, peak: np.ndarray, assigned: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
+# step 5b: fine frequency estimation, one whole dwell at a time
+# ---------------------------------------------------------------------------
+# The framed peak search above is what finds and labels the signal, and it is
+# very good at that. It is a poor *frequency* estimator, and its weakness is
+# not noise: a parabola through three log-magnitude bins of a Hann-windowed
+# frame is a biased fit, and the bias is a fixed function of where the tone
+# sits inside its bin. Every point sits at its own fixed fractional bin
+# position, so every point gets its own fixed error -- up to 78 Hz, 58 Hz sd
+# across the standard 20-point plan -- and that error is identical in every
+# frame of every visit. Averaging cannot touch it, which is exactly the
+# measured behaviour: the spread does not fall with listen time.
+#
+# The cure is to stop estimating frequency from a framed spectrogram. Within
+# one dwell the transmitter emits a clean CW tone of known start and length, so
+# the whole dwell can be used coherently:
+#
+#   1. mix the dwell down by the coarse frequency the comb search already
+#      established, so the residual sits near DC;
+#   2. boxcar-decimate, which is a linear-phase average -- it cannot bias a
+#      frequency estimate, it costs nothing in Fisher information, and it cuts
+#      the noise bandwidth by the decimation factor;
+#   3. estimate the residual with a maximum-likelihood periodogram search.
+#
+# One 10 ms dwell then lands within a few percent of the Cramer-Rao bound,
+# which at 10 dB per-sample SNR is 0.078 Hz -- roughly 700x better than the
+# framed estimator, and unlike it, improving with SNR and with dwell.
+#
+# Guards matter. The synthesiser retunes into the start of each dwell, so the
+# first millisecond or so is a settling chirp rather than a tone; a coherent
+# fit over the whole dwell would swallow it, where a median over frames spat it
+# out. Trimming the head and tail of every dwell is what makes the coherent fit
+# safe, and it is cheap: precision goes as the 3/2 power of the usable length.
+
+DEFAULT_ESTIMATOR = "ml"
+DEFAULT_DECIMATE = 32           # 2.5 MS/s -> 78.1 kS/s, still ±39 kHz of room
+DEFAULT_GUARD_START_S = 1.5e-3  # retune settling lands at the head of a dwell
+DEFAULT_GUARD_END_S = 0.2e-3    # epoch is known to about half a frame
+MAX_GUARD_FRACTION = 0.35       # never trim away more than this of a dwell
+MIN_VISIT_SAMPLES = 32          # decimated samples; fewer and the fit is junk
+DEFAULT_VISIT_SNR_DB = 6.0      # a visit must stand this far above its noise
+# One dwell is already a complete measurement -- 0.08 Hz at 10 dB -- so a
+# point is reported from a single visit. The framed estimator needed a crowd
+# of frames because each frame was poor; this one does not.
+MIN_VISITS_PER_POINT = 1
+OUTLIER_MADS = 6.0              # visit rejection, in median absolute deviations
+MIN_VISITS_FOR_OUTLIER_CUT = 4  # below this a MAD has no meaning
+# Below this the coherence diagnostic cannot separate anything: maximising
+# over frequency fits random phases well when there are few of them, so the
+# random-phase null itself sits at 0.87 for 3 visits and 0.57 for 5, leaving no
+# room above it. By 8 visits the null is 0.41 and a real coherence of ~1.0
+# stands clear; the default 2 s capture gives 10.
+MIN_VISITS_FOR_COHERENCE = 8
+SETTLING_SIGMA = 5.0            # half-split this far from zero earns a warning
+# The visits of one point are independent measurements of one number, so their
+# scatter should match what the Cramer-Rao bound allows for their SNR and
+# length. Scattering far wider means something is moving that the model does
+# not have -- and the number would then be precise and wrong, which is the one
+# failure this tool exists to refuse.
+MAX_EXCESS_SCATTER = 5.0
+MIN_VISITS_FOR_SCATTER = 8
+COMBINE_NAMES = ("incoherent", "coherent")
+
+
+def mix_and_decimate(raw: np.ndarray, cycles: float, start: int,
+                     factor: int) -> np.ndarray:
+    """Mix down by ``cycles`` per sample and boxcar-decimate, in one pass.
+
+    The two steps fold together because the mixing exponential factorises over
+    the decimation blocks: with ``n = m*D + k``,
+
+        exp(-2i pi c n) = exp(-2i pi c D m) * exp(-2i pi c k)
+
+    so the inner factor is one fixed vector of length D reused for every block,
+    and only one exponential per OUTPUT sample is ever computed instead of one
+    per input sample. On a Pi that is most of the decode.
+
+    ``start`` is the absolute sample index, so every visit is mixed against one
+    common clock and the phases stay comparable between them -- which is what
+    the coherence diagnostic needs. The phase is reduced modulo a cycle before
+    being scaled, because the absolute index reaches tens of millions over a
+    long capture and multiplying that by 2*pi first would throw away digits
+    that matter.
+    """
+    factor = max(1, int(factor))
+    m = raw.size // factor
+    if m < MIN_VISIT_SAMPLES:
+        return np.empty(0, dtype=np.complex128)
+    blocks = raw[:m * factor].reshape(m, factor).astype(np.complex128)
+    k = np.arange(factor, dtype=np.float64)
+    inner = np.exp(-2j * np.pi * np.mod(cycles * k, 1.0))
+    outer_n = np.arange(m, dtype=np.float64) * factor + float(start)
+    outer = np.exp(-2j * np.pi * np.mod(cycles * outer_n, 1.0))
+    return (blocks @ inner) / factor * outer
+
+
+def fine_zeropad(y: np.ndarray, fs: float, pad: int = 32) -> float:
+    """Zero-padded periodogram peak with a log-parabolic touch-up.
+
+    Rectangular window and no framing, so the interpolation bias that dogs the
+    framed estimator is already down at the padding grid's resolution.
+    """
+    m = y.size
+    n = int(2 ** np.ceil(np.log2(max(m * pad, 16))))
+    p = np.abs(np.fft.fft(y, n)) ** 2
+    k = int(np.argmax(p))
+    a = np.log(p[(k - 1) % n] + 1e-300)
+    b = np.log(p[k] + 1e-300)
+    c = np.log(p[(k + 1) % n] + 1e-300)
+    den = a - 2 * b + c
+    d = 0.5 * (a - c) / den if abs(den) > 1e-12 else 0.0
+    kk = k if k <= n // 2 else k - n
+    return (kk + float(np.clip(d, -0.5, 0.5))) * fs / n
+
+
+def fine_jacobsen(y: np.ndarray, fs: float) -> float:
+    """Jacobsen's three-bin complex interpolator on the natural-resolution DFT."""
+    m = y.size
+    x = np.fft.fft(y)
+    k = int(np.argmax(np.abs(x)))
+    a, b, c = x[(k - 1) % m], x[k], x[(k + 1) % m]
+    den = 2 * b - a - c
+    d = float(np.real((a - c) / den)) if abs(den) > 1e-300 else 0.0
+    kk = k if k <= m // 2 else k - m
+    return (kk + float(np.clip(d, -0.5, 0.5))) * fs / m
+
+
+def fine_kay(y: np.ndarray, fs: float) -> float:
+    """Kay's weighted phase-difference estimator.
+
+    Efficient at high SNR and O(N), but it has a hard threshold: it works on
+    raw sample-to-sample phase differences, so once the per-sample SNR drops
+    the differences wrap and the estimate collapses. Kept for comparison.
+    """
+    m = y.size
+    if m < 3:
+        return 0.0
+    dphi = np.angle(y[1:] * np.conj(y[:-1]))
+    n = np.arange(m - 1)
+    w = 1.0 - ((n - (m / 2 - 1)) / (m / 2)) ** 2
+    total = w.sum()
+    if total <= 0:
+        return 0.0
+    return float(np.sum(w / total * dphi) * fs / (2 * np.pi))
+
+
+def fine_phase_slope(y: np.ndarray, fs: float) -> float:
+    """Amplitude-weighted least-squares fit of unwrapped phase against time.
+
+    Demodulated by a coarse estimate first, so the residual slope is far under
+    pi per sample and the unwrap cannot take a wrong branch.
+    """
+    m = y.size
+    if m < 3:
+        return 0.0
+    t = np.arange(m) / fs
+    coarse = fine_zeropad(y, fs)
+    z = y * np.exp(-2j * np.pi * coarse * t)
+    ph = np.unwrap(np.angle(z))
+    w = np.abs(z) ** 2
+    sw = w.sum()
+    if sw <= 0:
+        return coarse
+    tm = float((w * t).sum() / sw)
+    pm = float((w * ph).sum() / sw)
+    den = float((w * (t - tm) ** 2).sum())
+    if den <= 0:
+        return coarse
+    slope = float((w * (t - tm) * (ph - pm)).sum() / den)
+    return coarse + slope / (2 * np.pi)
+
+
+def fine_ml(y: np.ndarray, fs: float, pad: int = 4, iters: int = 3) -> float:
+    """Maximum likelihood: periodogram peak, then Newton onto the true maximum.
+
+    For a single tone in white Gaussian noise the periodogram maximum IS the
+    maximum-likelihood estimate, so this is not a heuristic that happens to
+    work -- it is the estimator the Cramer-Rao bound is written about, and it
+    attains that bound wherever it is above threshold. Measured at 1.010x the
+    bound from -5 dB to 20 dB per sample.
+
+    ``pad`` only has to land Newton inside the right lobe, and Newton does the
+    rest: the measured accuracy is 1.010x the bound at every padding factor
+    from 2 to 32, so the small one is chosen and the FFT is 2.5x cheaper. The
+    zero-padded peak alone, without the Newton step, would need the large one.
+    """
+    m = y.size
+    if m < 3:
+        return 0.0
+    f = fine_zeropad(y, fs, pad)
+    n = np.arange(m) / fs
+    limit = 0.5 * fs / m
+    for _ in range(iters):
+        e = np.exp(-2j * np.pi * f * n)
+        s = np.dot(y, e)
+        s1 = np.dot(y * (-2j * np.pi * n), e)
+        s2 = np.dot(y * (-2j * np.pi * n) ** 2, e)
+        d1 = 2.0 * np.real(np.conj(s) * s1)
+        d2 = 2.0 * np.real(np.conj(s) * s2 + s1 * np.conj(s1))
+        if not np.isfinite(d2) or d2 >= 0:
+            break                                # not a maximum; keep the peak
+        f -= float(np.clip(d1 / d2, -limit, limit))
+    return f
+
+
+#: Fine estimators, all taking (segment near DC, sample rate) -> Hz.
+#: ``peak`` is not here: it is the framed estimator above, which needs the
+#: whole spectrogram rather than one segment.
+FINE_ESTIMATORS = {
+    "ml": fine_ml,
+    "zeropad": fine_zeropad,
+    "jacobsen": fine_jacobsen,
+    "kay": fine_kay,
+    "phase-slope": fine_phase_slope,
+}
+ESTIMATOR_NAMES = ("peak",) + tuple(FINE_ESTIMATORS)
+
+
+def sd_bias_factor(n: int) -> float:
+    """c4(n): a sample standard deviation from n points reads low, by this much.
+
+    E[s] = c4(n) * sigma, not sigma -- 0.94 at five points, 0.97 at ten. It
+    matters here because the standard error each point reports is compared
+    against the Cramer-Rao bound, and an uncorrected s makes a perfectly
+    efficient estimator look like it is beating a bound that cannot be beaten.
+    """
+    if n < 2:
+        return float("nan")
+    if n > 300:                          # c4 -> 1; lgamma is exact but pointless
+        return 1.0 - 0.25 / n
+    return math.sqrt(2.0 / (n - 1)) * math.exp(
+        math.lgamma(n / 2.0) - math.lgamma((n - 1) / 2.0))
+
+
+def crb_hz(snr_lin: float, nsamples: int, ts: float) -> float:
+    """Cramer-Rao lower bound, in Hz sd, for one tone in white Gaussian noise.
+
+    ``snr_lin`` is per-sample signal power over noise power. This is the floor
+    every estimator here is measured against; nothing can beat it, and the
+    honest question about any estimator is only how close to it it gets.
+    """
+    if snr_lin <= 0 or nsamples < 2:
+        return float("inf")
+    n = float(nsamples)
+    return float(np.sqrt(6.0 / ((2 * np.pi) ** 2 * snr_lin * n * (n * n - 1)
+                                * ts * ts)))
+
+
+@dataclass
+class Visit:
+    """One dwell on one point: when it was, what it measured, how much to trust it."""
+    point: int
+    start_s: float          # capture time of the usable part of the dwell
+    mid_s: float
+    samples: int            # decimated samples actually fitted
+    residual_hz: float      # measured minus the coarse model, in Hz
+    snr_db: float
+    weight: float           # 1 / variance, from the Cramer-Rao bound
+    phasor: complex         # complex amplitude at the fitted frequency
+    half_split_hz: float    # first half minus second half of the same dwell
+
+
+def visit_windows(hops: list[Hop], points: int, period_cycles: int,
+                  epoch_s: float, capture_s: float,
+                  guard_start_s: float = DEFAULT_GUARD_START_S,
+                  guard_end_s: float = DEFAULT_GUARD_END_S
+                  ) -> list[tuple[int, float, float]]:
+    """Every dwell the schedule places inside the capture, head and tail trimmed.
+
+    ``epoch_s`` is what :func:`align_epoch` returns: schedule time = capture
+    time + epoch, modulo the period. So a hop the schedule puts at ``s0``
+    appears in the capture at ``s0 - epoch`` and every period thereafter.
+
+    The guards are not tuning knobs to be shaved for precision. The head guard
+    covers the retune -- the transmitter changes frequency into the start of a
+    dwell, so the first part of it is a settling chirp -- and the tail guard
+    covers the epoch's own resolution. A coherent fit has no median to throw
+    those away for it.
+    """
+    per = points * period_cycles
+    period_s = period_duration(hops, points, period_cycles)
+    out: list[tuple[int, float, float]] = []
+    for hop in hops[:per]:
+        dwell = hop.end_s - hop.start_s
+        head = min(guard_start_s, MAX_GUARD_FRACTION * dwell)
+        tail = min(guard_end_s, MAX_GUARD_FRACTION * dwell)
+        base = (hop.start_s - epoch_s) % period_s
+        k = 0
+        while True:
+            t0 = base + k * period_s + head
+            t1 = base + k * period_s + dwell - tail
+            if t0 >= capture_s:
+                break
+            if t1 <= capture_s and t1 > t0:
+                out.append((hop.point, t0, t1))
+            k += 1
+    out.sort(key=lambda v: v[1])
+    return out
+
+
+def measure_visits(capture: Capture, windows: list[tuple[int, float, float]],
+                   if_nom: np.ndarray, offset_hz: float, centre_hz: float,
+                   fs: float, estimator: str = DEFAULT_ESTIMATOR,
+                   decimate: int = DEFAULT_DECIMATE,
+                   min_snr_db: float = DEFAULT_VISIT_SNR_DB) -> list[Visit]:
+    """Fit each dwell on its own: mix to DC, decimate, estimate the residual.
+
+    The mixdown uses ABSOLUTE capture time, not time from the start of the
+    segment. That costs nothing and it means the phase of every visit is
+    referred to one common clock, which is what makes the cross-visit
+    coherence diagnostic below meaningful rather than vacuous.
+    """
+    fine = FINE_ESTIMATORS.get(estimator)
+    if fine is None:
+        raise ValueError(f"unknown fine estimator {estimator!r}; "
+                         f"choose from {', '.join(FINE_ESTIMATORS)}")
+    fsd = fs / max(1, int(decimate))
+    visits: list[Visit] = []
+    for point, t0, t1 in windows:
+        i0 = int(np.ceil(t0 * fs))
+        i1 = int(np.floor(t1 * fs))
+        raw = capture.samples(i0, i1 - i0)
+        if raw.size < MIN_VISIT_SAMPLES * max(1, int(decimate)):
+            continue
+        cycles = (if_nom[point] + offset_hz - centre_hz) / fs
+        y = mix_and_decimate(raw, cycles, i0, decimate)
+        if y.size < MIN_VISIT_SAMPLES:
+            continue
+        residual = float(fine(y, fsd))
+
+        m = y.size
+        tt = np.arange(m) / fsd
+        s = complex(np.dot(y, np.exp(-2j * np.pi * residual * tt)))
+        amp2 = abs(s) ** 2 / (m * m)
+        total = float(np.mean(np.abs(y) ** 2))
+        noise = max(total - amp2, total * 1e-12, 1e-300)
+        snr = amp2 / noise
+        if 10.0 * np.log10(max(snr, 1e-300)) < min_snr_db:
+            continue
+        # Inverse variance straight from the bound: var ~ 1/(snr * N^3 * Ts^2).
+        weight = snr * float(m) * (m * m - 1.0) / (fsd * fsd)
+        # Fit each half of the dwell separately too. A clean CW tone gives the
+        # same answer twice; a settling chirp that the head guard did not fully
+        # cover, or anything else that makes the dwell not-a-tone, shows up as
+        # a difference. It turns "is the guard long enough?" from a judgement
+        # call into a number the run reports.
+        h = m // 2
+        if h >= MIN_VISIT_SAMPLES:
+            split = float(fine(y[:h], fsd)) - float(fine(y[h:2 * h], fsd))
+        else:
+            split = float("nan")
+        visits.append(Visit(point=point, start_s=t0,
+                            mid_s=0.5 * (t0 + t1), samples=m,
+                            residual_hz=residual,
+                            snr_db=float(10.0 * np.log10(max(snr, 1e-300))),
+                            weight=float(weight), phasor=s,
+                            half_split_hz=split))
+    return visits
+
+
+def settling_check(visits: list[Visit]) -> tuple[float, float]:
+    """(mean half-split, its standard error) in Hz, over every visit.
+
+    Well clear of zero means the dwells are not clean tones where they are
+    being fitted -- almost always a retune still settling past the head guard.
+    The standard error is what makes the number readable: a split of 0.5 Hz
+    with a 0.4 Hz standard error is nothing, and the same split with a 0.01 Hz
+    standard error is a bias sitting on every point.
+    """
+    vals = np.array([v.half_split_hz for v in visits
+                     if v.half_split_hz == v.half_split_hz])
+    if vals.size < 4:
+        return float("nan"), float("nan")
+    return float(vals.mean()), float(vals.std(ddof=1) / np.sqrt(vals.size))
+
+
+def fit_common_drift(visits: list[Visit], t_ref: float) -> float:
+    """One drift rate in Hz/s, common to every point, fitted jointly.
+
+    The LNB's LO walks about 4.5 Hz/s, which is not noise and does not average
+    away: with a repeating schedule each point is always visited at the same
+    phase of the period, so each point's mean visit time sits at a fixed
+    distance from the capture's centre and the drift lands on it as a fixed
+    per-point offset -- about 0.9 Hz peak-to-peak across a 200 ms period, and
+    no better for a longer capture. Removing the drift with a common slope,
+    fitted across every visit of every point at once, takes that out.
+
+    Solved by sweeping out the per-point means: each point's own offset is a
+    nuisance parameter here, so subtracting each point's weighted mean time and
+    residual leaves a single slope to fit.
+    """
+    if len(visits) < 4:
+        return 0.0
+    pts = np.array([v.point for v in visits])
+    t = np.array([v.mid_s for v in visits]) - t_ref
+    r = np.array([v.residual_hz for v in visits])
+    w = np.array([v.weight for v in visits])
+    num = den = 0.0
+    for p in np.unique(pts):
+        m = pts == p
+        if int(m.sum()) < 2:
+            continue
+        sw = w[m].sum()
+        if sw <= 0:
+            continue
+        dt = t[m] - (w[m] * t[m]).sum() / sw
+        dr = r[m] - (w[m] * r[m]).sum() / sw
+        num += float((w[m] * dt * dr).sum())
+        den += float((w[m] * dt * dt).sum())
+    return float(num / den) if den > 0 else 0.0
+
+
+def combine_visits(visits: list[Visit], point: int,
+                   drift_hz_s: float = 0.0, t_ref: float = 0.0
+                   ) -> tuple[float, float, float, int, int] | None:
+    """Inverse-variance mean of one point's visits, outliers thrown out first.
+
+    Not a median. The visits are independent samples of the same quantity, so
+    a mean is the efficient combiner and a median throws away a quarter of the
+    precision for nothing -- measured at 1.28x worse, which is the textbook
+    ratio. What a median was buying was protection against a visit that landed
+    on a hop boundary or a settling chirp, and that is bought here instead by
+    an explicit median-absolute-deviation cut, which discards the bad visit
+    outright rather than diluting it.
+
+    Returns (mean residual, standard error, bound-predicted standard error,
+    used, total). The last is what the Cramer-Rao bound says this many visits
+    at this SNR ought to achieve: quoting it beside the measured scatter is
+    what turns "the estimator is efficient" from a claim about synthetic
+    signals into something the operator's own capture either confirms or
+    contradicts.
+    """
+    mine = [v for v in visits if v.point == point]
+    if len(mine) < MIN_VISITS_PER_POINT:
+        return None
+    r = np.array([v.residual_hz - drift_hz_s * (v.mid_s - t_ref) for v in mine])
+    w = np.array([v.weight for v in mine])
+    keep = np.ones_like(r, dtype=bool)
+    if r.size >= MIN_VISITS_FOR_OUTLIER_CUT:
+        med = float(np.median(r))
+        mad = float(np.median(np.abs(r - med)))
+        scale = max(1.4826 * mad, 1e-9)
+        keep = np.abs(r - med) <= OUTLIER_MADS * scale
+        if int(keep.sum()) < MIN_VISITS_FOR_OUTLIER_CUT:
+            keep = np.ones_like(r, dtype=bool)
+    rk, wk = r[keep], w[keep]
+    sw = float(wk.sum())
+    if sw <= 0:
+        return None
+    mean = float((wk * rk).sum() / sw)
+    n = int(keep.sum())
+    if n > 1:
+        # Spread of the visits themselves, not the bound's promise: if
+        # something unmodelled is moving, this is what shows it.
+        var = float((wk * (rk - mean) ** 2).sum() / sw) * n / (n - 1)
+        stderr = float(np.sqrt(max(var, 0.0) / n) / sd_bias_factor(n))
+    else:
+        stderr = float("nan")
+    # The weights ARE inverse variances up to the bound's constant: with
+    # w = snr * N(N^2-1) / fs^2, the bound is var = 6 / ((2 pi)^2 * w), so the
+    # inverse-variance mean of them has variance 6 / ((2 pi)^2 * sum w).
+    predicted = float(np.sqrt(6.0 / ((2 * np.pi) ** 2 * sw)))
+    return mean, stderr, predicted, n, len(mine)
+
+
+def visit_coherence(visits: list[Visit], point: int, period_s: float,
+                    steps: int = 512, null_draws: int = 24,
+                    rng_seed: int = 7) -> tuple[float, float]:
+    """Is one point's phase related across visits? Returns (measured, null).
+
+    Free-running transmitter phase would make a joint fit over every visit of a
+    point enormously better than averaging them -- precision would grow with
+    the 3/2 power of the whole capture rather than the square root of the visit
+    count. Whether that is available is a fact about the hardware, not a
+    choice, so it is measured rather than assumed.
+
+    The statistic is the coherent sum of the per-visit phasors, aligned by the
+    best common frequency, over the incoherent sum:
+
+        max_f  |sum_v S_v exp(-2 pi i f t_v)|^2 / (V * sum_v |S_v|^2)
+
+    which is 1 when the phases line up exactly. What it is when they do NOT is
+    emphatically not zero -- maximising over f fits noise, and with only a
+    handful of visits it fits it well -- so the null is measured rather than
+    reasoned about: the same statistic, on the same magnitudes at the same
+    times, with the phases replaced by random ones. Coherence is real only when
+    the measured value clears that null, and the report prints both so the
+    comparison is visible rather than buried in a threshold.
+    """
+    mine = [v for v in visits if v.point == point]
+    if len(mine) < MIN_VISITS_FOR_COHERENCE:
+        return float("nan"), float("nan")
+    s_v = np.array([v.phasor for v in mine])
+    t = np.array([v.start_s for v in mine])
+    power = float(np.sum(np.abs(s_v) ** 2))
+    if power <= 0:
+        return float("nan"), float("nan")
+    span = 1.0 / max(period_s, 1e-12)
+    grid = np.linspace(-0.5 * span, 0.5 * span, steps)
+    basis = np.exp(-2j * np.pi * np.outer(grid, t))
+    scale = len(mine) * power
+
+    def stat(phasors: np.ndarray) -> float:
+        return float((np.abs(basis @ phasors) ** 2).max() / scale)
+
+    measured = stat(s_v)
+    rng = np.random.default_rng(rng_seed)
+    mag = np.abs(s_v)
+    null = [stat(mag * np.exp(2j * np.pi * rng.uniform(0, 1, mag.size)))
+            for _ in range(null_draws)]
+    return measured, float(np.percentile(null, 95))
+
+
+def combine_visits_coherently(visits: list[Visit], point: int,
+                              period_s: float, seed_hz: float,
+                              steps: int = 4096) -> float:
+    """Joint fit over every visit of one point, using their phases.
+
+    Worth an enormous amount when it applies -- 76x over averaging at four
+    visits, 152x at sixteen, because precision then grows with the 3/2 power of
+    the whole capture span instead of the square root of the visit count. It
+    applies only when the transmitter's phase is actually related between
+    visits, which for a synthesiser that retunes away and relocks it is not,
+    and which an LNB drifting at 4.5 Hz/s would destroy even if it were. Never
+    call this without checking :func:`visit_coherence` first: on incoherent
+    input it does not degrade, it locks onto the wrong lobe of the 1/period
+    comb and returns a confident answer that is 30-90x WORSE than the average
+    it replaced.
+
+    ``seed_hz`` is the incoherent estimate, which picks the lobe; the lobes are
+    1/period apart and the incoherent estimate is orders of magnitude tighter
+    than that, so the choice is never close.
+    """
+    mine = [v for v in visits if v.point == point]
+    if len(mine) < 3:
+        return seed_hz
+    s_v = np.array([v.phasor for v in mine])
+    t = np.array([v.start_s for v in mine])
+    half = 0.5 / max(period_s, 1e-12)
+    grid = np.linspace(seed_hz - half, seed_hz + half, steps)
+    power = np.abs(np.exp(-2j * np.pi * np.outer(grid, t)) @ s_v) ** 2
+    k = int(np.argmax(power))
+    if 0 < k < steps - 1:
+        a, b, c = power[k - 1], power[k], power[k + 1]
+        den = a - 2 * b + c
+        d = 0.5 * (a - c) / den if abs(den) > 1e-30 else 0.0
+        return float(grid[k] + np.clip(d, -0.5, 0.5) * (grid[1] - grid[0]))
+    return float(grid[k])
+
+
+def measure_points_fine(capture: Capture, hops: list[Hop], points: int,
+                        period_cycles: int, epoch_s: float, if_nom: np.ndarray,
+                        offset_hz: float, centre_hz: float, fs: float, *,
+                        estimator: str = DEFAULT_ESTIMATOR,
+                        decimate: int = DEFAULT_DECIMATE,
+                        guard_start_s: float = DEFAULT_GUARD_START_S,
+                        guard_end_s: float = DEFAULT_GUARD_END_S,
+                        min_snr_db: float = DEFAULT_VISIT_SNR_DB,
+                        fit_drift: bool = True, combine: str = "incoherent"
+                        ) -> tuple[list[PointResult], list[Visit], float, int,
+                                   list[str]]:
+    """Whole-dwell coherent measurement of every point.
+
+    Returns (rows, visits fitted, drift Hz/s, dwells the schedule offered).
+    """
+    capture_s = capture.nsamples / fs
+    windows = visit_windows(hops, points, period_cycles, epoch_s, capture_s,
+                            guard_start_s, guard_end_s)
+    visits = measure_visits(capture, windows, if_nom, offset_hz, centre_hz, fs,
+                            estimator=estimator, decimate=decimate,
+                            min_snr_db=min_snr_db)
+    t_ref = capture_s / 2.0
+    drift = fit_common_drift(visits, t_ref) if fit_drift else 0.0
+    period_s = period_duration(hops, points, period_cycles)
+
+    measured = {p: combine_visits(visits, p, drift, t_ref)
+                for p in range(len(if_nom))}
+    coherences = {p: visit_coherence(visits, p, period_s)
+                  for p in measured if measured[p] is not None}
+
+    # The gate on coherent combination is decided ONCE, over every point at
+    # once, and never per point. A per-point test at any sensible confidence
+    # lets roughly one point in twenty through by chance, and one point
+    # combined coherently when it should not be lands a whole Hz out and ruins
+    # the spread that the other nineteen just earned. The ensemble median is
+    # not close to its threshold in either direction, so deciding once is both
+    # safer and better founded.
+    notes: list[str] = []
+    go_coherent = False
+    if combine == "coherent" and coherences:
+        got = float(np.median([c for c, _ in coherences.values()]))
+        null = float(np.median([n for _, n in coherences.values()]))
+        go_coherent = got == got and null == null and got > null
+        if not go_coherent:
+            notes.append(
+                f"coherent combination was asked for and refused: measured "
+                f"coherence {got:.3f} does not clear its random-phase null of "
+                f"{null:.3f}, so the visits carry no usable phase relation. A "
+                f"coherent fit on those does not blur, it locks onto the wrong "
+                f"lobe of the 1/period comb and is tens of times worse than "
+                f"the average it would replace")
+
+    rows: list[PointResult] = []
+    for p in range(len(if_nom)):
+        combined = measured[p]
+        if combined is None:
+            continue
+        residual, stderr, predicted, used, total = combined
+        mine = [v for v in visits if v.point == p]
+        coh, null = coherences[p]
+        if go_coherent:
+            residual = combine_visits_coherently(visits, p, period_s, residual)
+            stderr = float("nan")
+        error = offset_hz + residual
+        rows.append(PointResult(
+            point=p, nominal_if_hz=float(if_nom[p]),
+            measured_if_hz=float(if_nom[p]) + error, error_hz=error,
+            frames_used=used, frames_assigned=total,
+            envelope_db=float(np.median([v.snr_db for v in mine])),
+            visits_used=used, visits_total=total, stderr_hz=stderr,
+            crb_hz=predicted, coherence=coh, coherence_null=null))
+    return rows, visits, drift, len(windows), notes
+
+
+# ---------------------------------------------------------------------------
 # the whole decode
 # ---------------------------------------------------------------------------
 @dataclass
@@ -380,6 +1042,13 @@ class DecodeResult:
     slot_half_hz: float
     rows: list[PointResult] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    estimator: str = DEFAULT_ESTIMATOR
+    drift_hz_s: float = 0.0
+    visits: int = 0
+    combine: str = "incoherent"
+    settling_hz: float = float("nan")
+    settling_stderr_hz: float = float("nan")
+    excess_scatter: float = float("nan")
 
     @property
     def errors_hz(self) -> np.ndarray:
@@ -392,6 +1061,18 @@ class DecodeResult:
     @property
     def spread_hz(self) -> float:
         return float(np.std(self.errors_hz)) if self.rows else float("nan")
+
+    @property
+    def stderr_hz(self) -> float:
+        """Standard error of the median error, from the point-to-point spread.
+
+        The spread is what the points disagree by; this is how well their
+        centre is pinned. Reported separately because they answer different
+        questions and conflating them is how a tolerance gets overstated.
+        """
+        n = len(self.rows)
+        return float(np.std(self.errors_hz, ddof=1) / np.sqrt(n)) if n > 1 \
+            else float("nan")
 
     @property
     def trustworthy(self) -> bool:
@@ -426,7 +1107,13 @@ def decode(source, *, fs: float, centre_hz: float,
            lo_hz: float = DEFAULT_LO_HZ,
            frame: int = DEFAULT_FRAME,
            threshold_db: float = DEFAULT_THRESHOLD_DB,
-           search_hz: float = DEFAULT_SEARCH_HZ) -> DecodeResult:
+           search_hz: float = DEFAULT_SEARCH_HZ,
+           estimator: str = DEFAULT_ESTIMATOR,
+           decimate: int = DEFAULT_DECIMATE,
+           guard_start_s: float = DEFAULT_GUARD_START_S,
+           guard_end_s: float = DEFAULT_GUARD_END_S,
+           fit_drift: bool = True,
+           combine: str = "incoherent") -> DecodeResult:
     """Run the five steps over one capture and report per-point error.
 
     ``source`` is a path to interleaved int16 I/Q or a complex array. How many
@@ -447,12 +1134,29 @@ def decode(source, *, fs: float, centre_hz: float,
                                     if_nom, search_hz)
     half = slot_half_width(if_nom)
     slots = point_slots(fbins, if_nom, offset, half)
-    env, peak = point_envelopes(capture, window, fbins, slots)
+    env, peak = point_envelopes(capture, window, fbins, slots,
+                                want_peak=estimator == "peak")
     env_db = envelope_db(env)
     epoch = align_epoch(env_db, hops, points, frame_s, period_cycles)
-    rows = measure_points(env_db, peak, epoch.assigned, if_nom, threshold_db)
 
-    warnings: list[str] = []
+    drift = 0.0
+    nvisits = offered = 0
+    notes: list[str] = []
+    settle = settle_err = float("nan")
+    if estimator == "peak":
+        # The original estimator, kept so the improvement can be demonstrated
+        # on identical input rather than asserted.
+        rows = measure_points(env_db, peak, epoch.assigned, if_nom, threshold_db)
+    else:
+        rows, visits, drift, offered, notes = measure_points_fine(
+            capture, hops, points, period_cycles, epoch.shift_s, if_nom,
+            offset, centre_hz, fs, estimator=estimator, decimate=decimate,
+            guard_start_s=guard_start_s, guard_end_s=guard_end_s,
+            fit_drift=fit_drift, combine=combine)
+        nvisits = len(visits)
+        settle, settle_err = settling_check(visits)
+
+    warnings: list[str] = list(notes)
     if sharpness < MIN_COMB_SHARPNESS:
         warnings.append(
             f"comb sharpness {sharpness:.1f}x is under {MIN_COMB_SHARPNESS:g}x "
@@ -469,6 +1173,35 @@ def decode(source, *, fs: float, centre_hz: float,
         warnings.append(
             f"dwell spans {min_hop_s/frame_s:.1f} frames; lower --frame or "
             f"raise the dwell (want at least 4, ideally 20+)")
+    if estimator != "peak" and offered and nvisits < 0.7 * offered:
+        warnings.append(
+            f"only {nvisits} of {offered} scheduled dwells were strong enough "
+            f"to fit -- the signal is absent or weak for much of the capture, "
+            f"so the points that did fit are not a fair sample of it")
+    excess = float("nan")
+    if estimator != "peak" and rows:
+        got = np.array([r.stderr_hz for r in rows])
+        want = np.array([r.crb_hz for r in rows])
+        ok = np.isfinite(got) & np.isfinite(want) & (want > 0)
+        # Below a handful of visits a standard error is itself so uncertain
+        # that the ratio says nothing, so it is withheld rather than printed
+        # with a caveat nobody reads.
+        enough = np.median([r.visits_used for r in rows]) >= MIN_VISITS_FOR_SCATTER
+        if ok.sum() >= 3 and enough:
+            excess = float(np.median(got[ok] / want[ok]))
+            if excess > MAX_EXCESS_SCATTER:
+                warnings.append(
+                    f"each point's visits scatter {excess:.1f}x wider than the "
+                    f"Cramer-Rao bound allows for their SNR -- the tone is not "
+                    f"what the model says it is, so the quoted precision is "
+                    f"not the accuracy")
+    if (settle == settle and settle_err == settle_err and settle_err > 0
+            and abs(settle) > SETTLING_SIGMA * settle_err):
+        warnings.append(
+            f"the two halves of a dwell disagree by {settle:+.3f} +/-"
+            f"{settle_err:.3f} Hz -- the dwells are not clean tones where they "
+            f"are being fitted, so raise --guard-start-ms until this comes "
+            f"back to zero")
     span = float(if_nom[-1] - if_nom[0])
     if span > fs * 0.8:
         warnings.append(
@@ -480,7 +1213,9 @@ def decode(source, *, fs: float, centre_hz: float,
         epoch_sigma=epoch.sigma, period_s=epoch.period_s, points=points,
         recovered=len(rows), frame_s=frame_s, nframes=capture.nframes,
         seconds=capture.nframes * frame_s, slot_half_hz=half, rows=rows,
-        warnings=warnings)
+        warnings=warnings, estimator=estimator, drift_hz_s=drift,
+        visits=nvisits, combine=combine, settling_hz=settle,
+        settling_stderr_hz=settle_err, excess_scatter=excess)
 
 
 # ---------------------------------------------------------------------------
@@ -495,13 +1230,33 @@ def synthesise(*, fs: float, centre_hz: float, seed: int = DEFAULT_SEED,
                period_cycles: int = DEFAULT_PERIOD_CYCLES,
                lo_hz: float = DEFAULT_LO_HZ, seconds: float = 0.6,
                offset_hz: float = -106e3, start_at_s: float = 0.0,
-               snr_db: float = 10.0, noise_seed: int = 1) -> np.ndarray:
+               snr_db: float = 10.0, noise_seed: int = 1,
+               visit_phase: str = "random", settle_s: float = 0.0,
+               settle_hz: float = 0.0, drift_hz_s: float = 0.0
+               ) -> np.ndarray:
     """Build the capture a perfect receiver would have taken, with a known answer.
 
     One tone at a time, hopping exactly on the schedule, the whole comb shifted
     by ``offset_hz`` and the capture starting ``start_at_s`` into the schedule.
     Recovering those two numbers is the test.
+
+    ``visit_phase`` is the honest part and the default is the pessimistic one.
+    ``"random"`` gives every dwell an independent starting phase, which is what
+    a synthesiser that retunes away and relocks actually does: the loop
+    reacquires with no memory of where its phase was last time it sat here.
+    ``"coherent"`` models one free-running oscillator whose phase is
+    ``2*pi*f*t`` throughout, which would let a receiver combine every visit to
+    a point coherently and do vastly better. That option exists so the size of
+    the prize can be measured, and so the failure when the assumption is wrong
+    can be measured too -- it is not the default, because it is not true.
+
+    ``settle_s`` and ``settle_hz`` put a decaying frequency error at the head
+    of every dwell, which is what a PLL retuning into the start of a dwell
+    looks like. ``drift_hz_s`` walks every point together, as the LNB's LO
+    does at about 4.5 Hz/s.
     """
+    if visit_phase not in ("random", "coherent"):
+        raise ValueError("visit_phase must be 'random' or 'coherent'")
     freqs = plan_frequencies(round(start_hz), round(stop_hz), points)
     if_nom = np.asarray(freqs, dtype=float) - lo_hz
     span_s = start_at_s + seconds
@@ -514,6 +1269,7 @@ def synthesise(*, fs: float, centre_hz: float, seed: int = DEFAULT_SEED,
     sigma = 10.0 ** (-snr_db / 20.0) / np.sqrt(2.0)
     x = (rng.standard_normal(n) + 1j * rng.standard_normal(n)) * sigma
     t = np.arange(n) / fs + start_at_s          # time on the schedule's clock
+    tau_c = settle_s / 3.0 if settle_s > 0 else 0.0
     for hop in hops:
         if hop.end_s <= start_at_s or hop.start_s >= span_s:
             continue
@@ -523,7 +1279,31 @@ def synthesise(*, fs: float, centre_hz: float, seed: int = DEFAULT_SEED,
         if hi <= lo:
             continue
         baseband = if_nom[hop.point] + offset_hz - centre_hz
-        x[lo:hi] += np.exp(2j * np.pi * baseband * t[lo:hi])
+        if visit_phase == "coherent" and not (drift_hz_s or tau_c):
+            x[lo:hi] += np.exp(2j * np.pi * baseband * t[lo:hi])
+            continue
+        # Phase is integrated from the instantaneous frequency, so a settling
+        # chirp and a drifting LO are modelled rather than approximated.
+        local = t[lo:hi] - hop.start_s
+        phase = 2 * np.pi * baseband * local
+        if visit_phase == "coherent":
+            phase += 2 * np.pi * baseband * hop.start_s
+        else:
+            phase += rng.uniform(0.0, 2 * np.pi)
+        if drift_hz_s:
+            # A drifting oscillator integrates: phase(t) = 2*pi*(f*t + g*t^2/2)
+            # with t measured from the start of the run, not from the start of
+            # this dwell. The t0^2/2 term is the phase the drift has already
+            # piled up before this visit began, and leaving it out would make
+            # a drifting LO look coherent from visit to visit when it is the
+            # very thing that destroys that coherence.
+            t0 = hop.start_s
+            phase += 2 * np.pi * drift_hz_s * (0.5 * t0 * t0 + t0 * local
+                                               + 0.5 * local * local)
+        if tau_c > 0 and settle_hz:
+            phase += (2 * np.pi * settle_hz * tau_c
+                      * (1.0 - np.exp(-local / tau_c)))
+        x[lo:hi] += np.exp(1j * phase)
     return x.astype(np.complex64)
 
 
@@ -590,23 +1370,55 @@ def format_report(result: DecodeResult) -> str:
              f"  points       : {result.recovered}/{result.points} recovered "
              f"from {result.nframes} frames ({result.seconds:.2f} s, "
              f"slot +/-{result.slot_half_hz/1e3:.1f} kHz)",
+             f"  estimator    : {result.estimator}" + (
+                 "  (framed FFT peak, median over frames)"
+                 if result.estimator == "peak" else
+                 f"  (whole dwell, {result.visits} dwells fitted, "
+                 f"drift {result.drift_hz_s:+.2f} Hz/s removed)"),
              "",
-             "  point   nominal IF        measured IF         error   frames"
-             "   env",
-             "  " + "-" * 68]
+             "  point   nominal IF        measured IF         error    +/-"
+             "      n    SNR",
+             "  " + "-" * 74]
     for row in result.rows:
         lines.append(
             f"  {row.point:5d}   {row.nominal_if_hz/1e6:11.6f} MHz  "
             f"{row.measured_if_hz/1e6:11.6f} MHz  "
             f"{row.error_hz/1e3:+8.3f} kHz  "
-            f"{row.frames_used:4d}/{row.frames_assigned:<4d} "
-            f"{row.envelope_db:5.1f} dB")
+            f"{row.stderr_hz:7.3f} "
+            f"{row.frames_used:5d} "
+            f"{row.envelope_db:6.1f} dB")
     if result.rows:
         lines += ["",
                   f"  median error : {result.median_error_hz/1e3:+.3f} kHz "
                   f"over {result.recovered} points",
-                  f"  spread       : {result.spread_hz:.0f} Hz sd "
-                  f"(point to point)"]
+                  f"  spread       : {result.spread_hz:.3f} Hz sd "
+                  f"(point to point)",
+                  f"  centre       : +/-{result.stderr_hz:.3f} Hz standard "
+                  f"error on the median"]
+        if result.excess_scatter == result.excess_scatter:
+            lines.append(
+                f"  vs the bound : {result.excess_scatter:.2f}x the "
+                f"Cramer-Rao limit for this SNR and dwell (1.0 = nothing left "
+                f"on the table, high = something unmodelled is moving)")
+        if result.estimator != "peak":
+            seen = [(r.coherence, r.coherence_null) for r in result.rows
+                    if r.coherence == r.coherence]
+            if seen:
+                got = float(np.median([c for c, _ in seen]))
+                null = float(np.median([n for _, n in seen]))
+                verdict = ("phase IS related across visits -- a joint "
+                           "coherent fit would do far better"
+                           if got > null else
+                           "no phase relation across visits, as expected of "
+                           "a synthesiser that retunes away and relocks")
+                lines.append(
+                    f"  coherence    : {got:.3f} against a random-phase null "
+                    f"of {null:.3f} -- {verdict}")
+            if result.settling_hz == result.settling_hz:
+                lines.append(
+                    f"  dwell halves : {result.settling_hz:+.3f} +/-"
+                    f"{result.settling_stderr_hz:.3f} Hz apart (0 means the "
+                    f"fitted part of every dwell is a clean tone)")
     else:
         lines.append("  nothing recovered")
     if result.warnings:
@@ -680,6 +1492,40 @@ def build_parser() -> argparse.ArgumentParser:
                          f"floor (default {DEFAULT_THRESHOLD_DB:g})")
     an.add_argument("--search-hz", type=float, default=DEFAULT_SEARCH_HZ,
                     help="comb offset search half-range in Hz")
+    an.add_argument("--estimator", choices=ESTIMATOR_NAMES,
+                    default=DEFAULT_ESTIMATOR,
+                    help="how each point's frequency is measured. 'peak' is "
+                         "the original framed FFT peak with a median over "
+                         "frames -- it has a fixed per-point interpolation "
+                         "bias of tens of Hz that no amount of listening "
+                         "removes. The rest fit whole dwells coherently; "
+                         f"'ml' (default) is maximum likelihood and reaches "
+                         "the Cramer-Rao bound")
+    an.add_argument("--decimate", type=int, default=DEFAULT_DECIMATE,
+                    help="boxcar decimation before the whole-dwell fit "
+                         f"(default {DEFAULT_DECIMATE}); costs no precision "
+                         "and cuts the noise bandwidth")
+    an.add_argument("--guard-start-ms", type=float,
+                    default=DEFAULT_GUARD_START_S * 1e3,
+                    help="skip this much at the head of every dwell, where "
+                         "the synthesiser is still settling from the retune "
+                         f"(default {DEFAULT_GUARD_START_S*1e3:g} ms)")
+    an.add_argument("--guard-end-ms", type=float,
+                    default=DEFAULT_GUARD_END_S * 1e3,
+                    help="skip this much at the tail of every dwell "
+                         f"(default {DEFAULT_GUARD_END_S*1e3:g} ms)")
+    an.add_argument("--combine", choices=COMBINE_NAMES, default="incoherent",
+                    help="how one point's many dwells are combined. "
+                         "'incoherent' (default) averages them by inverse "
+                         "variance and gains sqrt(visits). 'coherent' fits "
+                         "their phases jointly and gains far more, but only "
+                         "if the transmitter's phase is actually related "
+                         "between visits -- it is refused per point where the "
+                         "measured coherence says otherwise")
+    an.add_argument("--no-drift-fit", action="store_true",
+                    help="do not fit and remove a common linear drift; the "
+                         "LNB LO walks about 4.5 Hz/s and a repeating "
+                         "schedule turns that into a fixed per-point offset")
     an.add_argument("--json", action="store_true",
                     help="print the result as JSON as well")
     an.add_argument("--self-test", action="store_true",
@@ -744,7 +1590,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = decode(source, frame=args.frame,
                         threshold_db=args.threshold_db,
-                        search_hz=args.search_hz, **common)
+                        search_hz=args.search_hz, estimator=args.estimator,
+                        decimate=args.decimate,
+                        guard_start_s=args.guard_start_ms / 1e3,
+                        guard_end_s=args.guard_end_ms / 1e3,
+                        fit_drift=not args.no_drift_fit,
+                        combine=args.combine, **common)
     finally:
         if tmp_path is not None and tmp_path.exists():
             tmp_path.unlink()

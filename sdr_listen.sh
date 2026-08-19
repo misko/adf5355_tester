@@ -37,9 +37,15 @@ LO_HZ="${LO_HZ:-9.75e9}"              # NOMINAL LNB LO. 13 V, no 22 kHz tone
                                       # selects low band = 9.75 GHz.
 LO_ERROR_HZ="${LO_ERROR_HZ:-94000}"   # measured LNB LO error, used only to
                                       # centre the receiver on the comb
-SECONDS_LISTEN="${SECONDS_LISTEN:-2}" # 2 s = 10 periods. Measured: every
-                                      # metric is flat from 1 period to 160,
-                                      # so longer only costs decode time.
+SECONDS_LISTEN="${SECONDS_LISTEN:-2}" # 2 s = 10 periods. Two periods is a hard
+                                      # floor: below that some points are never
+                                      # transmitted. Above it, precision now
+                                      # improves as sqrt(listen time) -- the
+                                      # old flat-forever behaviour was the
+                                      # framed estimator's fixed bias, which
+                                      # the whole-dwell fit removed. 2 s gives
+                                      # ~0.04 Hz; 8 s gives ~0.02 Hz for 4x
+                                      # the decode time.
 FS="${FS:-2.5e6}"                     # 2.5 MS/s gives about 2 MHz usable
 FRAME="${FRAME:-512}"                 # must be well under one dwell
 GAIN="${GAIN:-40}"

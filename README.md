@@ -224,6 +224,83 @@ true to the schedule.
 
 ---
 
+## Running a calibration end to end
+
+A complete worked example against a PlutoSDR behind a 13 V (low band) universal
+LNB, whose nominal LO is 9.750 GHz.
+
+**Frequency plan.** Five rungs, 10.7 to 11.5 GHz in 200 MHz steps, one pass
+every 30 s, so `u = 30 / (5 x 6) = 1.0 s` and the bursts are 1, 2, 3, 4 and 5 s.
+Subtracting the LNB LO gives the IF each rung lands on:
+
+| rung | burst | RF | IF (RF − 9.75 GHz) |
+|---:|---:|---:|---:|
+| 1 | 1 s | 10.700 GHz | 950 MHz |
+| 2 | 2 s | 10.900 GHz | 1150 MHz |
+| 3 | 3 s | 11.100 GHz | 1350 MHz |
+| 4 | 4 s | 11.300 GHz | 1550 MHz |
+| 5 | 5 s | 11.500 GHz | 1750 MHz |
+
+Those IFs sit inside the LNB's low-band output passband (roughly 950–2150 MHz).
+13 V with no 22 kHz tone selects low band; high band would use a 10.6 GHz LO and
+move every rung.
+
+### 1. Transmit (this repository, on the Pi driving the ADF5355)
+
+Start the ladder first and leave it looping for the whole receive session. Twelve
+passes is 6 minutes, comfortably longer than five 40 s captures:
+
+```bash
+adf5355 ladder --start-ghz 10.7 --stop-ghz 11.5                --steps 5 --total-s 30                --loops 12 --power 0 --enable-rf
+```
+
+The receiver is never told when a rung keys. It recovers that from burst length.
+
+### 2. Receive and solve (pluto-plus-utils, on the host with the radio)
+
+One capture per rung, retuned to that rung's nominal IF. Each capture must be
+longer than one full pass plus the longest burst, so the rung is guaranteed to
+appear complete rather than clipped at an edge:
+
+```bash
+for IF in 950000000 1150000000 1350000000 1550000000 1750000000; do
+    uv run pluto radio settings set RADIO --frequency $IF
+    uv run pluto capture start RADIO --duration 40
+done
+```
+
+Then hand the artifact IDs to the calibrator, telling it the *published* ladder
+parameters — the same numbers used above:
+
+```bash
+uv run pluto calibrate freq-ladder ART_1 ART_2 ART_3 ART_4 ART_5     --rung-start-hz 10.7e9 --rung-stop-hz 11.5e9 --rung-count 5     --total-seconds 30 --lo-hz 9.75e9
+```
+
+It identifies each burst by duration, maps it back to that rung's frequency, and
+fits the receiver's clock error (slope) and the LNB's LO error (intercept). A
+single capture can be inspected on its own with
+`pluto analyze ARTIFACT_ID --analyzer freq_ladder`.
+
+### 3. Apply
+
+```
+    xo_new = xo_current x (1 + d_rx)
+```
+
+Re-run the calibration afterwards and confirm the fitted slope collapses toward
+zero — that also confirms the sign.
+
+### Choosing the parameters
+
+- **Span as wide as the LNB IF allows.** The slope is the receiver's clock error,
+  so its precision is roughly (measurement error) / (IF span). A 2 GHz span is
+  worth far more than a 200 MHz one.
+- **At least 3 rungs**, or slope and intercept cannot be separated. Five or more
+  leaves room for leave-one-out uncertainty.
+- **Several passes.** A single monotonic pass confounds LO drift with the slope.
+- **Keep `total_s` generous** so the shortest burst is comfortably longer than a
+  capture frame; `u = total_s / (N(N+1))`.
+
 ## Using the ladder to measure a receiver's clock offset
 
 This is what the ladder is for. A downstream SDR can recover both its **clock

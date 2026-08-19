@@ -18,7 +18,7 @@ from adf5355 import Channel, SynthConfig, plan
 from adf5355.hopper import make_period, plan_frequencies
 from adf5355.registers import FIELDS
 
-MAGIC = 0x35354441  # "AD55" little endian -- v3 carries one period plus a count
+MAGIC = 0x36354441  # "AD56" little endian -- v4 adds per-hop autocal
 
 # v3 exists because v2 stored the whole run. The schedule repeats, so the plan
 # now carries a single period and the number of hops to play; the transmitter
@@ -40,6 +40,10 @@ def main() -> int:
                    help="loop until signalled -- total hop count is left at 0")
     p.add_argument("--period-cycles", type=int, default=1,
                    help="permutations per repeat of the pattern")
+    p.add_argument("--autocal-every", action="store_true",
+                   help="recalibrate the VCO band on every hop. Required "
+                        "once the span exceeds one band; costs the settle "
+                        "time, so the dwell has to be long enough for it")
     p.add_argument("--ref-mhz", type=float, default=125.0)
     p.add_argument("--power", type=int, default=0)
     p.add_argument("--channel", default="B", choices=["A", "B"])
@@ -67,7 +71,7 @@ def main() -> int:
     table = []
     for f in freqs:
         w = plan(cfg_on, f, channel).words
-        table.append((w[1], w[2], w[0] & ~autocal))
+        table.append((w[1], w[2], w[0] & ~autocal, w[0] | autocal))
 
     r6_on = plan(cfg_off if args.mute else cfg_on,
                  freqs[0], channel).registers.word(6)
@@ -86,11 +90,11 @@ def main() -> int:
     with open(args.out, "wb") as fh:
         fh.write(struct.pack("<IIIQQII", MAGIC, len(freqs), len(seq),
                              total_hops, dwell_ns, r6_on, r6_off))
-        fh.write(struct.pack("<I", delay_us))
+        fh.write(struct.pack("<II", delay_us, 1 if args.autocal_every else 0))
         for w in boot_words:                     # 13 words, R0 first
             fh.write(struct.pack("<I", w))
-        for r1, r2, r0 in table:
-            fh.write(struct.pack("<III", r1, r2, r0))
+        for r1, r2, r0, r0cal in table:
+            fh.write(struct.pack("<IIII", r1, r2, r0, r0cal))
         for s in seq:
             fh.write(struct.pack("<H", s))
 
@@ -100,6 +104,7 @@ def main() -> int:
           f"{len(freqs)} points, period {len(seq)} hops "
           f"({len(seq)*args.hop_ms/1000:.4f} s), plays {span}, "
           f"{args.hop_ms:g} ms dwell, "
+          f"{'autocal every hop' if args.autocal_every else 'no per-hop autocal'}, "
           f"R6 on 0x{r6_on:08X} off 0x{r6_off:08X}")
     return 0
 

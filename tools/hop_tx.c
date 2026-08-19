@@ -11,10 +11,11 @@
  *     accumulate, with a short spin to cover the timer's own granularity
  *   - no allocator and no collector in the timed path at all
  *
- * Plan file v3 (little endian):
- *   magic "AD55" u32 | points u32 | period_len u32 | total_hops u64
- *   dwell_ns u64 | r6_on u32 | r6_off u32 | delay_us u32 | boot 13 x u32
- *   points x 3 u32       (R1, R2, R0-without-autocal per point)
+ * Plan file v4 (little endian):
+ *   magic "AD56" u32 | points u32 | period_len u32 | total_hops u64
+ *   dwell_ns u64 | r6_on u32 | r6_off u32 | delay_us u32 | autocal_every u32
+ *   boot 13 x u32
+ *   points x 4 u32       (R1, R2, R0-no-autocal, R0-with-autocal per point)
  *   period_len x u16     (point index per hop, ONE period)
  *
  * The plan carries one period, not the whole run: the schedule repeats, so
@@ -132,19 +133,20 @@ int main(int argc, char **argv){
     if (!f){ perror("plan"); return 1; }
     uint32_t magic, points, period_len, r6_on, r6_off;
     uint64_t total_hops, dwell_ns;
-    if (fread(&magic,4,1,f)!=1 || magic != 0x35354441u){ /* "AD55" LE */
-        fprintf(stderr, "bad plan magic (need v3; re-run emit_hop_plan.py)\n");
+    if (fread(&magic,4,1,f)!=1 || magic != 0x36354441u){ /* "AD56" LE */
+        fprintf(stderr, "bad plan magic (need v4; re-run emit_hop_plan.py)\n");
         return 1; }
     fread(&points,4,1,f); fread(&period_len,4,1,f);
     fread(&total_hops,8,1,f); fread(&dwell_ns,8,1,f);
     fread(&r6_on,4,1,f);  fread(&r6_off,4,1,f);
     if (period_len == 0){ fprintf(stderr, "empty period\n"); return 1; }
-    uint32_t delay_us = 0, boot[13];
+    uint32_t delay_us = 0, autocal_every = 0, boot[13];
     fread(&delay_us,4,1,f);
+    fread(&autocal_every,4,1,f);
     fread(boot, sizeof(uint32_t), 13, f);
-    uint32_t *tbl = malloc(points*3*sizeof(uint32_t));
+    uint32_t *tbl = malloc(points*4*sizeof(uint32_t));
     uint16_t *seq = malloc(period_len*sizeof(uint16_t));
-    fread(tbl, sizeof(uint32_t), points*3, f);
+    fread(tbl, sizeof(uint32_t), points*4, f);
     fread(seq, sizeof(uint16_t), period_len, f);
     fclose(f);
 
@@ -166,7 +168,7 @@ int main(int argc, char **argv){
         pinned = (sched_setaffinity(0, sizeof set, &set) == 0);
     }
     /* Touch the whole working set so no page fault lands mid-dwell. */
-    for (uint32_t i=0;i<points*3;i++) (void)tbl[i];
+    for (uint32_t i=0;i<points*4;i++) (void)tbl[i];
     for (uint32_t i=0;i<period_len;i++) (void)seq[i];
     memset(hist, 0, sizeof hist);            /* fault it in before timing */
 
@@ -182,7 +184,9 @@ int main(int argc, char **argv){
     usleep(20000);                       /* let the loop settle before keying */
 
     /* first point, then key the output */
-    wr(tbl[seq[0]*3+0]); wr(tbl[seq[0]*3+1]); wr(tbl[seq[0]*3+2]);
+    wr(tbl[seq[0]*4+0]); wr(tbl[seq[0]*4+1]);
+    wr(tbl[seq[0]*4 + (autocal_every?3:2)]);
+    if (autocal_every) usleep(delay_us);
     wr(r6_on);
 
     struct timespec start; clock_gettime(CLOCK_MONOTONIC, &start);
@@ -196,8 +200,9 @@ int main(int argc, char **argv){
         hist_add(ns_of(&now) - deadline);
         played++;
         if (total_hops == 0 || i+1 < total_hops){
-            const uint32_t *w = &tbl[seq[(i+1) % period_len]*3];
-            wr(w[0]); wr(w[1]); wr(w[2]);
+            const uint32_t *w = &tbl[seq[(i+1) % period_len]*4];
+            wr(w[0]); wr(w[1]); wr(w[autocal_every ? 3 : 2]);
+            if (autocal_every) usleep(delay_us);
         }
     }
     wr(r6_off);
@@ -211,11 +216,11 @@ int main(int argc, char **argv){
       "\"elapsed_s\":%.6f,\"sched_s\":%.6f,\"median_us\":%.3f,"
       "\"p99_us\":%.3f,\"max_us\":%.3f,\"late\":%llu,\"rt\":%d,"
       "\"mlock\":%d,\"spi_hz\":%u,\"spin_us\":%ld,\"cpu\":%d,"
-      "\"pinned\":%d,\"pmqos\":%d}\n",
+      "\"pinned\":%d,\"pmqos\":%d,\"autocal\":%u}\n",
       (unsigned long long)played, period_len, dwell_ns/1000.0, elapsed,
       (double)played*dwell_ns/1e9, hist_q(0.5), hist_q(0.99),
       hist_max/1000.0, (unsigned long long)over, rt, locked, spi_speed,
-      spin_ns/1000L, cpu_pin, pinned, latency_fd >= 0);
+      spin_ns/1000L, cpu_pin, pinned, latency_fd >= 0, autocal_every);
     close(spi_fd);
     if (latency_fd >= 0) close(latency_fd);   /* releases the PM QoS hold */
     return 0;

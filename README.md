@@ -238,6 +238,58 @@ true to the schedule.
 
 ---
 
+### Fast, narrow ladders: the whole cycle in one capture
+
+The Ku-band default steps 250 MHz between rungs, so a receiver has to retune for
+each one. If instead the entire span fits inside the receiver's instantaneous
+bandwidth, the whole ladder is heard at a **single tuning**, which is both far
+more convenient and better measurement practice:
+
+- every rung shares one `rx_lo`, so the receiver's tuning-dependent bias becomes
+  common mode instead of differing rung to rung;
+- many complete cycles fit in one listen, so there is far more data to average;
+- no retuning gaps, so nothing is missed between rungs.
+
+The synthesiser is much faster than the default suggests. Measured on a Pi 4
+over 1 MHz SPI: a full retune is **0.84 ms** and keying the output is
+**0.075 ms**, so the per-rung control cost is about **1 ms**. `u = 10 ms` leaves
+tenfold headroom, and with busy-wait deadlines the realised bursts hold to
+**6 µs median, 24 µs worst** — 0.06% of a unit.
+
+A ladder sized for a receiver listening at 2.5 MS/s (about 2 MHz usable):
+
+```bash
+adf5355 ladder --start-ghz 11.0 --stop-ghz 11.00171 \
+               --steps 20 --total-s 4.2 \
+               --loops 6 --power 0 --enable-rf
+```
+
+20 rungs, 90 kHz apart, spanning 1.71 MHz; `u = 10 ms`, so bursts run 10 ms to
+200 ms and a full cycle takes 4.2 s. A 20 second capture therefore contains
+nearly five complete cycles — around 95 individually identified bursts from one
+tuning.
+
+`ladder` refuses a schedule whose shortest burst approaches the control
+overhead, since the emitted pattern would stop matching the published one and
+duration coding would break down:
+
+```
+$ adf5355 ladder --start-ghz 11.0 --stop-ghz 11.002 --steps 20 --total-s 0.4
+error: shortest burst 0.95 ms is under 4x the ~0.99 ms control overhead;
+       raise --total-s or lower --steps
+```
+
+**What a narrow ladder cannot do.** The receiver's clock error is the *slope* of
+Δf against frequency, so recovering it needs frequency span. Across 1.71 MHz a
+9 ppm clock error moves Δf by only about 15 Hz, well under the receiver's
+tuning-dependent systematic. A single narrow ladder therefore measures the total
+offset at one frequency very precisely, but cannot separate the receiver's clock
+error from the LNB's LO error.
+
+To get both, run the fast narrow ladder at several widely separated centres —
+say 10.7, 11.1 and 11.5 GHz — and capture 20 s at each. Every capture yields a
+precise local Δf, and the spread across centres restores the lever arm.
+
 ## Running a calibration end to end
 
 > **Conducted path only.** This example is written for a closed bench setup: the

@@ -21,8 +21,9 @@ import time
 from .device import (DEFAULT_CE_GPIO, DEFAULT_MUXOUT_GPIO, DEFAULT_SPI_HZ,
                      ADF5355, LockTimeout)
 from .ladder import (make_ladder, format_ladder, run_ladder,
-                     overlaps_satellite_band, DEFAULT_START_HZ,
-                     DEFAULT_STOP_HZ, DEFAULT_STEPS, DEFAULT_TOTAL_S)
+                     overlaps_satellite_band, check_schedule_feasible,
+                     DEFAULT_START_HZ, DEFAULT_STOP_HZ, DEFAULT_STEPS,
+                     DEFAULT_TOTAL_S)
 from .plan import Channel, SynthConfig, plan
 from .registers import MuxOut, OutputPower
 
@@ -198,6 +199,12 @@ def cmd_ladder(args) -> int:
         steps = make_ladder(round(args.start_ghz * 1e9),
                             round(args.stop_ghz * 1e9),
                             args.steps, args.total_s)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        check_schedule_feasible(steps)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

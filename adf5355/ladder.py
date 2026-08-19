@@ -16,6 +16,7 @@ and the standalone adf5355_ladder.py agree step for step.
 """
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 
@@ -66,17 +67,33 @@ def make_ladder(start_hz: int = DEFAULT_START_HZ,
     return result
 
 
+def _digits_for(smallest: float, unit: float) -> int:
+    """Decimals needed to distinguish steps of `smallest`, expressed in `unit`."""
+    if smallest <= 0:
+        return 3
+    needed = -math.floor(math.log10(smallest / unit)) + 1
+    return max(3, min(9, int(needed)))
+
+
 def format_ladder(steps: list[LadderStep]) -> str:
-    lines = ["", "Duration-coded ladder",
-             "step  RF GHz     ON s   OFF s   timeline s",
-             "----  --------  -----  ------  ----------------"]
-    for s in steps:
-        lines.append(f"{s.index:>4}  {s.freq_hz/1e9:8.3f}  {s.on_s:5.3f}  "
-                     f"{s.off_s:6.3f}  {s.start_s:5.1f}-{s.end_s:5.1f}")
     span = steps[-1].freq_hz - steps[0].freq_hz
     spacing = span / (len(steps) - 1) if len(steps) > 1 else 0
-    lines.append(f"Range: {steps[0].freq_hz/1e9:.6f}-{steps[-1].freq_hz/1e9:.6f} "
-                 f"GHz in {len(steps)} bins, spacing {spacing/1e6:.6f} MHz")
+    # A narrow, fast ladder needs more decimals than a Ku-band sweep: 90 kHz
+    # steps all render as the same number at three places.
+    fdig = _digits_for(spacing, 1e9)
+    tdig = _digits_for(steps[0].on_s, 1.0)
+    fw, tw = fdig + 6, tdig + 4
+    lines = ["", "Duration-coded ladder",
+             f"step  {'RF GHz':>{fw}}  {'ON s':>{tw}}  {'OFF s':>{tw}}  timeline s",
+             f"----  {'-'*fw}  {'-'*tw}  {'-'*tw}  {'-'*(2*tw+1)}"]
+    for s in steps:
+        lines.append(f"{s.index:>4}  {s.freq_hz/1e9:{fw}.{fdig}f}  "
+                     f"{s.on_s:{tw}.{tdig}f}  {s.off_s:{tw}.{tdig}f}  "
+                     f"{s.start_s:.{tdig}f}-{s.end_s:.{tdig}f}")
+    sp_txt = (f"{spacing/1e6:.6f} MHz" if spacing >= 1e6
+              else f"{spacing/1e3:.3f} kHz")
+    lines.append(f"Range: {steps[0].freq_hz/1e9:.9f}-{steps[-1].freq_hz/1e9:.9f} "
+                 f"GHz in {len(steps)} bins, spacing {sp_txt}")
     lines.append(f"Unit time u = {steps[0].on_s:.6f} s; rung n is ON=n*u then "
                  f"OFF=n*u ({steps[0].on_s:.3f} s to {steps[-1].on_s:.3f} s "
                  f"per phase)")
@@ -88,12 +105,46 @@ def overlaps_satellite_band(steps: list[LadderStep]) -> bool:
     return any(SATBAND_LO_HZ <= s.freq_hz <= SATBAND_HI_HZ for s in steps)
 
 
+# time.sleep resolves to roughly a millisecond on Linux, which is 10% of a 10 ms
+# duration unit -- enough to blur one rung into the next.  Sleep to within this
+# margin, then spin.  Measured on a Pi 4 this holds a burst to 6 us median and
+# 24 us worst case, against 1 ms or so for sleep alone.
+SPIN_MARGIN_S = 0.002
+
+
 def _sleep_until(deadline: float) -> None:
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return
-        time.sleep(remaining)
+        if remaining > SPIN_MARGIN_S:
+            time.sleep(remaining - SPIN_MARGIN_S)
+        # spin out the last couple of milliseconds
+
+
+def control_overhead_s(steps: list[LadderStep]) -> float:
+    """Rough per-rung control cost: one retune plus two output writes.
+
+    Measured on a Pi 4 over 1 MHz SPI: retune 0.84 ms, key 0.075 ms.
+    """
+    return 0.99e-3
+
+
+def check_schedule_feasible(steps: list[LadderStep], *, minimum_ratio: float = 4.0) -> None:
+    """Refuse a schedule whose shortest burst is close to the control overhead.
+
+    Rung 1 is the shortest at u seconds; if that is not comfortably longer than
+    the time taken to retune and key, the emitted pattern stops matching the
+    published one and duration coding breaks down.
+    """
+    unit = steps[0].on_s
+    floor = control_overhead_s(steps)
+    if unit < minimum_ratio * floor:
+        raise ValueError(
+            f"shortest burst {unit*1e3:.2f} ms is under {minimum_ratio:g}x the "
+            f"~{floor*1e3:.2f} ms control overhead; raise --total-s or lower "
+            f"--steps"
+        )
 
 
 def run_ladder(dev, steps: list[LadderStep], channel, loops: int = 1,

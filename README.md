@@ -36,7 +36,7 @@ levels, so commanding it high and then low and watching the GPIO follow proves
 the entire chain — CE, CLK, DAT, LE and the chip's own register decode:
 
 ```bash
-python3 -m adf5355 probe --ref-mhz 40
+python3 -m adf5355 probe --ref-mhz 125
 ```
 
 Without MUXOUT wired (`--muxout-gpio -1`) the part is entirely open loop: writes
@@ -46,12 +46,19 @@ synthesizer did what you asked is to measure the RF output.
 ## Usage
 
 ```bash
-python3 -m adf5355 dump  --ref-mhz 40 --freq 2.4G          # registers, no hardware
-python3 -m adf5355 set   --ref-mhz 40 --freq 2.4G --enable-rf --hold 5
-python3 -m adf5355 set   --ref-mhz 40 --freq 11.7G --channel B --enable-rf
-python3 -m adf5355 sweep --ref-mhz 40 --start 1G --stop 6G --points 51
-python3 -m adf5355 off   --ref-mhz 40
+python3 -m adf5355 dump  --ref-mhz 125 --freq 2.4G          # registers, no hardware
+python3 -m adf5355 set   --ref-mhz 125 --freq 2.4G --enable-rf --hold 5
+python3 -m adf5355 set   --ref-mhz 125 --freq 11.7G --channel B --enable-rf
+python3 -m adf5355 sweep --ref-mhz 125 --start 1G --stop 6G --points 51
+python3 -m adf5355 off   --ref-mhz 125
 ```
+
+This board's reference is **125.000 MHz** (marked `R125.000` on X1), which is
+what the examples above use. Passing the wrong value is the single most likely
+reason a sweep runs cleanly but never locks: the registers are computed against
+the assumed reference, so the VCO lands somewhere else entirely and only the
+points that happen to fall back inside 3.4-6.8 GHz will lock. If you see
+scattered `LOCK FAILED` lines with no frequency pattern, check this first.
 
 `--ref-mhz` is required and never guessed: clone boards ship different
 oscillators, and every register depends on it. Read the marking on X1.
@@ -140,8 +147,8 @@ in `raspberry_pi_adf5355_ku_ladder_guide.pdf`, so a run with no range arguments
 is byte-for-byte the same ladder as before.
 
 ```bash
-python3 adf5355_ladder.py --ref-mhz 40 --dry-run
-python3 adf5355_ladder.py --ref-mhz 40 --start-ghz 8.0 --stop-ghz 9.0 \
+python3 adf5355_ladder.py --ref-mhz 125 --dry-run
+python3 adf5355_ladder.py --ref-mhz 125 --start-ghz 8.0 --stop-ghz 9.0 \
                           --steps 5 --total-s 6 --dry-run
 ```
 

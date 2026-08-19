@@ -16,6 +16,11 @@
 # be IDENTICAL to that script's -- those numbers are the entire protocol
 # between the two ends.
 #
+# WHAT THIS CANNOT DO: one narrow cluster measures the TOTAL offset precisely
+# and cannot say how much of it is the SDR's clock and how much is the LNB's
+# LO. For that, use sdr_lever.sh, which measures the same thing at clusters
+# more than a gigahertz apart in IF and fits them together.
+#
 # Override from the environment, e.g.
 #     SECONDS_LISTEN=20 FS=3e6 ./sdr_listen.sh
 #

@@ -51,8 +51,23 @@ the same generator, so the two ends cannot drift apart.
     # capture from the Pluto and decode in one go
     tools/hop_decode.py --seconds 8
 
+    # one cluster of a lever-arm schedule (see tools/lever_run.py for the run)
+    tools/hop_decode.py --clusters 4 --cluster 2 --seconds 3
+
     # no hardware, no capture: synthesise a known answer and recover it
     tools/hop_decode.py --self-test
+
+Clusters
+--------
+With ``--clusters`` the transmitter is hopping over several widely separated
+groups of points and this capture holds exactly one of them. Everything above
+is unchanged -- the comb, the epoch and the whole-dwell fit see one cluster's
+points and nothing else -- except that the schedule regenerated here is the
+full multi-cluster one, so the dwells belonging to other clusters are known to
+be dead air rather than mistaken for this cluster's points. A cluster's points
+sit on a Golomb ruler rather than a regular grid, because a regular comb can be
+slid onto itself and the search then has a rival peak one spacing away that
+mislabels every point; ``margin over the nearest rival`` is what reports that.
 """
 from __future__ import annotations
 
@@ -70,11 +85,17 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from adf5355.hopper import (DEFAULT_HOP_START_HZ, DEFAULT_HOP_STOP_HZ,  # noqa: E402
+from adf5355.hopper import (DEFAULT_BAND_EXTRA_S, DEFAULT_BLOCK,  # noqa: E402
+                            DEFAULT_CLUSTER_CENTRES_HZ,
+                            DEFAULT_CLUSTER_POINTS,
+                            DEFAULT_CLUSTER_SPAN_HZ,
+                            DEFAULT_HOP_START_HZ, DEFAULT_HOP_STOP_HZ,
                             DEFAULT_JITTER, DEFAULT_MIN_HOP_S,
                             DEFAULT_PERIOD_CYCLES, DEFAULT_POINTS,
-                            DEFAULT_SEED, Hop, describe, make_schedule,
-                            period_duration, plan_frequencies)
+                            DEFAULT_SEED, ClusterPlan, Hop, cluster_centres,
+                            describe, describe_clusters, make_cluster_schedule,
+                            make_schedule, period_duration, plan_clusters,
+                            plan_frequencies)
 
 # ---- receive-side defaults; sdr_listen.sh mirrors these -------------------
 DEFAULT_LO_HZ = 9.75e9          # nominal LNB LO: 13 V, no tone = low band
@@ -103,6 +124,16 @@ CHUNK_FRAMES = 4096             # frames per FFT batch, a memory/speed trade
 # sat at 37-422x comb sharpness.
 MIN_COMB_SHARPNESS = 8.0
 MIN_EPOCH_SIGMA = 10.0
+# A measured comb margin is judged against what the frequency plan allows,
+# not against a fixed number: it must reach this fraction of the way from 1x
+# (hopeless) to the geometric ceiling. A uniform 20-point comb has a ceiling
+# of 1.05x and so is barely judged at all -- which is honest, because such a
+# comb genuinely cannot be told from its own shifted copy.
+# The geometric ceiling is optimistic: a rival peak also collects the noise
+# floor under its bins, so a four-point Golomb cluster whose ceiling is 4x
+# measures about 2.3x at 12 dB. A third of the way to the ceiling separates
+# that comfortably from the 1.0x a genuine mis-lock gives.
+COMB_MARGIN_FRACTION = 0.3
 
 
 # ---------------------------------------------------------------------------
@@ -197,16 +228,26 @@ def mean_spectrum(capture: Capture, window: np.ndarray,
 # ---------------------------------------------------------------------------
 # step 2: where is the comb?
 # ---------------------------------------------------------------------------
-def comb_offset(mean_power: np.ndarray, fbins: np.ndarray,
+def comb_search(mean_power: np.ndarray, fbins: np.ndarray,
                 if_nom: np.ndarray, search_hz: float = DEFAULT_SEARCH_HZ,
-                step_hz: float | None = None) -> tuple[float, float]:
-    """Slide the expected comb over the spectrum; return (offset, sharpness).
+                step_hz: float | None = None) -> tuple[float, float, float]:
+    """Slide the expected comb over the spectrum. (offset, sharpness, margin).
 
     Every point shares one offset -- the LNB's LO error plus the receiver's
     clock error are common to all of them -- so the whole comb moves as one
     rigid object and matching it is a single-parameter search. Summed energy at
-    the expected bins is the score; peak over median is how far the winner
-    stands above the field.
+    the expected bins is the score.
+
+    Two confidence figures come out and they answer different questions.
+    ``sharpness``, peak over median, asks whether a comb was found at all.
+    ``margin``, peak over the best score more than a couple of bins away, asks
+    whether the RIGHT one was found -- and that is the question that matters,
+    because the failure it catches is silent. A comb that can be slid onto
+    itself has a rival peak scoring nearly as high, one whole spacing away,
+    and taking that one mislabels every point and returns a confident answer
+    wrong by a spacing. See :data:`adf5355.hopper.GOLOMB_RULERS` for why the
+    cluster layout has no such rival, and :func:`comb_ambiguity` for what
+    margin a given layout entitles you to expect.
     """
     bin_hz = float(fbins[1] - fbins[0])
     if step_hz is None:
@@ -219,7 +260,40 @@ def comb_offset(mean_power: np.ndarray, fbins: np.ndarray,
     scores = comb[idx].sum(axis=1)
     best = int(np.argmax(scores))
     sharpness = float(scores[best] / (np.median(scores) + 1e-30))
-    return float(offsets[best]), sharpness
+    away = np.abs(offsets - offsets[best]) > 2.0 * bin_hz
+    margin = (float(scores[best] / (scores[away].max() + 1e-30))
+              if away.any() else float("inf"))
+    return float(offsets[best]), sharpness, margin
+
+
+def comb_offset(mean_power: np.ndarray, fbins: np.ndarray,
+                if_nom: np.ndarray, search_hz: float = DEFAULT_SEARCH_HZ,
+                step_hz: float | None = None) -> tuple[float, float]:
+    """:func:`comb_search` without the margin, for callers that predate it."""
+    offset, sharpness, _ = comb_search(mean_power, fbins, if_nom, search_hz,
+                                       step_hz)
+    return offset, sharpness
+
+
+def comb_ambiguity(if_nom: np.ndarray, tol_hz: float) -> float:
+    """Largest fraction of a comb that a rigid shift can put back on itself.
+
+    A property of the frequency plan alone, computed without looking at any
+    data, and therefore the right thing to judge a measured margin against: a
+    uniformly spaced comb of P points scores (P-1)/P and cannot do better than
+    a margin of P/(P-1) no matter how clean the capture is, while a Golomb
+    ruler scores 1/P and should show a margin of about P.
+    """
+    f = np.sort(np.asarray(if_nom, dtype=float))
+    n = f.size
+    if n < 2:
+        return 1.0
+    shifts = np.unique(np.abs(f[:, None] - f[None, :]))
+    shifts = shifts[shifts > tol_hz]
+    if shifts.size == 0:
+        return 1.0 / n
+    hit = np.abs((f[None, :, None] + shifts[:, None, None]) - f[None, None, :])
+    return float((hit.min(axis=2) <= tol_hz).sum(axis=1).max()) / n
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +383,9 @@ class EpochFit:
 
 def align_epoch(env_db: np.ndarray, hops: list[Hop], points: int,
                 frame_s: float, period_cycles: int = DEFAULT_PERIOD_CYCLES,
-                oversample: int = 2) -> EpochFit:
+                oversample: int = 2, cluster: int | None = None,
+                hops_per_period: int | None = None,
+                period_s: float | None = None) -> EpochFit:
     """Find where in the schedule the capture starts.
 
     Bounded by one period, not by the length of the run: the pattern repeats
@@ -324,20 +400,34 @@ def align_epoch(env_db: np.ndarray, hops: list[Hop], points: int,
     a hop boundary -- so leaving them in would inflate the spread and make a
     perfect alignment look marginal.
     """
-    per = points * period_cycles
+    per = hops_per_period if hops_per_period is not None else points * period_cycles
     if len(hops) < per + 1:
         raise ValueError("schedule is shorter than one period")
-    period_s = period_duration(hops, points, period_cycles)
+    if period_s is None:
+        period_s = period_duration(hops, points, period_cycles)
     ends = np.array([h.end_s for h in hops[:per]])
-    expect = np.array([h.point for h in hops[:per]])
+    # -1 marks a hop that belongs to some OTHER cluster. Those slots are dead
+    # air for this receiver, so they are scored not at all rather than scored
+    # as a miss: what identifies the epoch is that MY dwells line up with MY
+    # tones, and the silence in between carries no information either way.
+    expect = np.array([h.point if (cluster is None or h.cluster == cluster)
+                       else -1 for h in hops[:per]])
+    if not (expect >= 0).any():
+        raise ValueError(f"no hops in cluster {cluster}")
     nframes = env_db.shape[1]
     ft = np.arange(nframes) * frame_s
     cols = np.arange(nframes)
     shifts = np.arange(0.0, period_s, frame_s / oversample)
     scores = np.empty(len(shifts))
+    mine_all = expect >= 0
     for k, shift in enumerate(shifts):
         idx = np.clip(np.searchsorted(ends, (ft + shift) % period_s), 0, per - 1)
-        scores[k] = env_db[expect[idx], cols].mean()
+        if mine_all.all():
+            scores[k] = env_db[expect[idx], cols].mean()
+            continue
+        sel = mine_all[idx]
+        scores[k] = (env_db[expect[idx][sel], cols[sel]].mean() if sel.any()
+                     else -np.inf)
     best = int(np.argmax(scores))
 
     guard = min(h.dwell_s for h in hops[:per])
@@ -665,7 +755,11 @@ class Visit:
 def visit_windows(hops: list[Hop], points: int, period_cycles: int,
                   epoch_s: float, capture_s: float,
                   guard_start_s: float = DEFAULT_GUARD_START_S,
-                  guard_end_s: float = DEFAULT_GUARD_END_S
+                  guard_end_s: float = DEFAULT_GUARD_END_S,
+                  cluster: int | None = None,
+                  hops_per_period: int | None = None,
+                  period_s: float | None = None,
+                  drop_band_change: bool = False
                   ) -> list[tuple[int, float, float]]:
     """Every dwell the schedule places inside the capture, head and tail trimmed.
 
@@ -679,13 +773,27 @@ def visit_windows(hops: list[Hop], points: int, period_cycles: int,
     covers the epoch's own resolution. A coherent fit has no median to throw
     those away for it.
     """
-    per = points * period_cycles
-    period_s = period_duration(hops, points, period_cycles)
+    per = hops_per_period if hops_per_period is not None else points * period_cycles
+    if period_s is None:
+        period_s = period_duration(hops, points, period_cycles)
     out: list[tuple[int, float, float]] = []
     for hop in hops[:per]:
+        if cluster is not None and hop.cluster != cluster:
+            continue
+        # The first dwell of a block is the one the synthesiser reached by a
+        # VCO band search, because it is the only hop that changes cluster.
+        # The schedule already made that dwell longer by exactly the settling
+        # allowance it carries, so skipping ``hop.settle_s`` leaves a measured
+        # window the same length as every other dwell's -- no point is lost and
+        # nothing is measured through a band search. ``drop_band_change``
+        # throws those dwells away entirely instead, which is the belt-and-
+        # braces answer if the half-split ever says the allowance is short.
+        if hop.band_change and drop_band_change:
+            continue
         dwell = hop.end_s - hop.start_s
-        head = min(guard_start_s, MAX_GUARD_FRACTION * dwell)
-        tail = min(guard_end_s, MAX_GUARD_FRACTION * dwell)
+        usable = dwell - hop.settle_s
+        head = hop.settle_s + min(guard_start_s, MAX_GUARD_FRACTION * usable)
+        tail = min(guard_end_s, MAX_GUARD_FRACTION * usable)
         base = (hop.start_s - epoch_s) % period_s
         k = 0
         while True:
@@ -958,7 +1066,11 @@ def measure_points_fine(capture: Capture, hops: list[Hop], points: int,
                         guard_start_s: float = DEFAULT_GUARD_START_S,
                         guard_end_s: float = DEFAULT_GUARD_END_S,
                         min_snr_db: float = DEFAULT_VISIT_SNR_DB,
-                        fit_drift: bool = True, combine: str = "incoherent"
+                        fit_drift: bool = True, combine: str = "incoherent",
+                        cluster: int | None = None,
+                        hops_per_period: int | None = None,
+                        period_s: float | None = None,
+                        drop_band_change: bool = False
                         ) -> tuple[list[PointResult], list[Visit], float, int,
                                    list[str]]:
     """Whole-dwell coherent measurement of every point.
@@ -967,13 +1079,17 @@ def measure_points_fine(capture: Capture, hops: list[Hop], points: int,
     """
     capture_s = capture.nsamples / fs
     windows = visit_windows(hops, points, period_cycles, epoch_s, capture_s,
-                            guard_start_s, guard_end_s)
+                            guard_start_s, guard_end_s, cluster=cluster,
+                            hops_per_period=hops_per_period,
+                            period_s=period_s,
+                            drop_band_change=drop_band_change)
     visits = measure_visits(capture, windows, if_nom, offset_hz, centre_hz, fs,
                             estimator=estimator, decimate=decimate,
                             min_snr_db=min_snr_db)
     t_ref = capture_s / 2.0
     drift = fit_common_drift(visits, t_ref) if fit_drift else 0.0
-    period_s = period_duration(hops, points, period_cycles)
+    if period_s is None:
+        period_s = period_duration(hops, points, period_cycles)
 
     measured = {p: combine_visits(visits, p, drift, t_ref)
                 for p in range(len(if_nom))}
@@ -1025,6 +1141,63 @@ def measure_points_fine(capture: Capture, hops: list[Hop], points: int,
 
 
 # ---------------------------------------------------------------------------
+# one capture, reduced to what the lever-arm fit consumes
+# ---------------------------------------------------------------------------
+def reduce_capture(rows: list[PointResult]) -> dict:
+    """Collapse a capture's points to a straight line in frequency.
+
+    Two numbers come out, and they are worth very different things:
+
+    * ``mean_error_hz`` at ``mean_if_hz`` -- the capture's offset. Every point
+      in one capture shares one rx_lo, so it also shares whatever bias that
+      tuning carries. This number therefore CANNOT be believed to better than
+      that bias (measured at 362 Hz peak to peak across eight tunings), and is
+      useful only in contrast with another capture at a distant cluster.
+    * ``slope`` -- how the offset varies with IF INSIDE this one capture, over
+      the sub-megahertz the cluster spans. A bias common to the whole capture
+      cancels out of a slope exactly, so this number is immune to the tuning
+      bias, to the LNB's LO error, and to the LNB's drift. It is the same
+      quantity the wide lever measures (-d_rx), from a lever arm about a
+      thousand times shorter -- which is precisely why it is worth having: the
+      two are vulnerable to completely different things, so they check each
+      other.
+
+    Weights come from the Cramer-Rao bound, and the reported standard errors
+    are then rescaled by sqrt(chi2/dof) of the fit itself, so a capture whose
+    points disagree more than the bound allows says so in its own error bars
+    instead of quietly claiming a precision it did not achieve.
+    """
+    if len(rows) < 2:
+        return {}
+    f = np.array([r.nominal_if_hz for r in rows], dtype=float)
+    e = np.array([r.error_hz for r in rows], dtype=float)
+    var = np.array([r.crb_hz for r in rows], dtype=float) ** 2
+    if not np.all(np.isfinite(var)) or not np.all(var > 0):
+        var = np.ones_like(f)
+    w = 1.0 / var
+    sw = w.sum()
+    fbar = float((w * f).sum() / sw)
+    x = f - fbar
+    sxx = float((w * x * x).sum())
+    a = float((w * e).sum() / sw)
+    b = float((w * x * e).sum() / sxx) if sxx > 0 else float("nan")
+    resid = e - (a + b * x)
+    dof = len(rows) - 2
+    scale = float(np.sqrt(max((w * resid * resid).sum(), 0.0) / dof)) if dof > 0 \
+        else float("nan")
+    scale_or_one = scale if scale == scale else 1.0
+    return {
+        "mean_if_hz": fbar,
+        "mean_error_hz": a,
+        "mean_error_stderr_hz": float(np.sqrt(1.0 / sw)) * scale_or_one,
+        "slope": b,
+        "slope_stderr": (float(np.sqrt(1.0 / sxx)) * scale_or_one
+                         if sxx > 0 else float("nan")),
+        "chi2_scale": scale,
+    }
+
+
+# ---------------------------------------------------------------------------
 # the whole decode
 # ---------------------------------------------------------------------------
 @dataclass
@@ -1049,6 +1222,20 @@ class DecodeResult:
     settling_hz: float = float("nan")
     settling_stderr_hz: float = float("nan")
     excess_scatter: float = float("nan")
+    # Peak over the best rival more than a couple of bins away: how sure the
+    # comb search is that it found the RIGHT comb, not merely a comb.
+    comb_margin: float = float("inf")
+    # ---- lever-arm bookkeeping: what one capture contributes to the fit ----
+    cluster: int = 0
+    cluster_centre_hz: float = float("nan")
+    centre_hz: float = float("nan")     # the rx_lo this capture actually used
+    t_abs_s: float = 0.0                # wall time at the middle of the capture
+    mean_if_hz: float = float("nan")    # weighted centre of this cluster's IFs
+    mean_error_hz: float = float("nan")     # the capture's offset AT mean_if_hz
+    mean_error_stderr_hz: float = float("nan")
+    slope: float = float("nan")         # d(error)/d(IF) inside this capture
+    slope_stderr: float = float("nan")
+    chi2_scale: float = float("nan")    # sqrt(chi2/dof) of that straight line
 
     @property
     def errors_hz(self) -> np.ndarray:
@@ -1113,16 +1300,45 @@ def decode(source, *, fs: float, centre_hz: float,
            guard_start_s: float = DEFAULT_GUARD_START_S,
            guard_end_s: float = DEFAULT_GUARD_END_S,
            fit_drift: bool = True,
-           combine: str = "incoherent") -> DecodeResult:
+           combine: str = "incoherent",
+           cluster_plan: ClusterPlan | None = None,
+           cluster: int = 0,
+           block: int = DEFAULT_BLOCK,
+           drop_band_change: bool = False,
+           band_extra_s: float = DEFAULT_BAND_EXTRA_S,
+           t_abs_s: float = 0.0) -> DecodeResult:
     """Run the five steps over one capture and report per-point error.
 
     ``source`` is a path to interleaved int16 I/Q or a complex array. How many
     cycles the transmitter ran does not matter and is never asked for: the
     schedule is periodic, so one period regenerated here covers any capture.
+
+    With ``cluster_plan`` given the transmitter is hopping over several widely
+    separated clusters and this capture holds exactly one of them. Everything
+    below is unchanged -- the comb, the epoch, the whole-dwell fit all see one
+    cluster's points and nothing else -- except that the schedule regenerated
+    here is the full multi-cluster one and the hops belonging to other clusters
+    are marked as dead air rather than as this cluster's points.
     """
-    freqs = plan_frequencies(round(start_hz), round(stop_hz), points)
-    hops = make_schedule(seed, freqs, min_hop_s, period_cycles + 1, jitter,
-                         period_cycles)
+    if cluster_plan is None:
+        freqs = plan_frequencies(round(start_hz), round(stop_hz), points)
+        hops = make_schedule(seed, freqs, min_hop_s, period_cycles + 1, jitter,
+                             period_cycles)
+        hops_per_period = points * period_cycles
+        period_s = period_duration(hops, points, period_cycles)
+        which = None
+        centre_rf = (freqs[0] + freqs[-1]) / 2.0
+    else:
+        points = cluster_plan.points
+        freqs = cluster_plan.freqs(cluster)
+        per_cycle = cluster_plan.clusters * cluster_plan.points
+        hops = make_cluster_schedule(seed, cluster_plan, min_hop_s,
+                                     period_cycles + 1, block, jitter,
+                                     period_cycles, band_extra_s)
+        hops_per_period = per_cycle * period_cycles
+        period_s = period_duration(hops, points, period_cycles, per_cycle)
+        which = cluster
+        centre_rf = float(cluster_plan.centres_hz[cluster])
     if_nom = np.asarray(freqs, dtype=float) - lo_hz
 
     capture = Capture(source, frame)
@@ -1130,14 +1346,16 @@ def decode(source, *, fs: float, centre_hz: float,
     fbins = frame_bins(frame, fs, centre_hz)
     frame_s = frame / fs
 
-    offset, sharpness = comb_offset(mean_spectrum(capture, window), fbins,
-                                    if_nom, search_hz)
+    offset, sharpness, margin = comb_search(mean_spectrum(capture, window),
+                                            fbins, if_nom, search_hz)
     half = slot_half_width(if_nom)
     slots = point_slots(fbins, if_nom, offset, half)
     env, peak = point_envelopes(capture, window, fbins, slots,
                                 want_peak=estimator == "peak")
     env_db = envelope_db(env)
-    epoch = align_epoch(env_db, hops, points, frame_s, period_cycles)
+    epoch = align_epoch(env_db, hops, points, frame_s, period_cycles,
+                        cluster=which, hops_per_period=hops_per_period,
+                        period_s=period_s)
 
     drift = 0.0
     nvisits = offered = 0
@@ -1152,7 +1370,9 @@ def decode(source, *, fs: float, centre_hz: float,
             capture, hops, points, period_cycles, epoch.shift_s, if_nom,
             offset, centre_hz, fs, estimator=estimator, decimate=decimate,
             guard_start_s=guard_start_s, guard_end_s=guard_end_s,
-            fit_drift=fit_drift, combine=combine)
+            fit_drift=fit_drift, combine=combine, cluster=which,
+            hops_per_period=hops_per_period, period_s=period_s,
+            drop_band_change=drop_band_change)
         nvisits = len(visits)
         settle, settle_err = settling_check(visits)
 
@@ -1161,6 +1381,19 @@ def decode(source, *, fs: float, centre_hz: float,
         warnings.append(
             f"comb sharpness {sharpness:.1f}x is under {MIN_COMB_SHARPNESS:g}x "
             f"-- the comb was not found; the offset below is not a measurement")
+    # What the plan itself entitles this capture to. A comb that can be slid
+    # onto itself simply cannot show a big margin, so judging every layout
+    # against one fixed number would either excuse the dangerous ones or
+    # condemn the safe ones.
+    ambiguity = comb_ambiguity(if_nom, float(fbins[1] - fbins[0]))
+    allowed = 1.0 / max(ambiguity, 1e-9)
+    if margin < 1.0 + COMB_MARGIN_FRACTION * (allowed - 1.0):
+        warnings.append(
+            f"the comb search found a rival peak only {margin:.2f}x below the "
+            f"winner, where this frequency plan should give about "
+            f"{allowed:.1f}x -- the comb may have locked onto a shifted copy "
+            f"of itself, which mislabels every point and moves the answer by "
+            f"a whole point spacing")
     if epoch.sigma < MIN_EPOCH_SIGMA:
         warnings.append(
             f"epoch sigma {epoch.sigma:.1f} is under {MIN_EPOCH_SIGMA:g} -- the "
@@ -1203,19 +1436,31 @@ def decode(source, *, fs: float, centre_hz: float,
             f"are being fitted, so raise --guard-start-ms until this comes "
             f"back to zero")
     span = float(if_nom[-1] - if_nom[0])
+    # How far the outermost tone actually sits from the tuning, using the
+    # comb offset the search just measured rather than a nominal one.
+    reach = float(np.max(np.abs(if_nom + offset - centre_hz)))
+    if reach > fs * 0.4:
+        warnings.append(
+            f"the comb reaches {reach/1e3:.0f} kHz from the tuning, past the "
+            f"{fs*0.4/1e3:.0f} kHz half-passband -- reduce the tuning dither "
+            f"or the cluster span, or raise --fs")
     if span > fs * 0.8:
         warnings.append(
             f"span {span/1e6:.3f} MHz exceeds the usable bandwidth "
             f"({fs*0.8/1e6:.3f} MHz); outer points cannot be heard")
 
+    seconds = capture.nframes * frame_s
     return DecodeResult(
-        comb_offset_hz=offset, comb_sharpness=sharpness, epoch_s=epoch.shift_s,
+        comb_offset_hz=offset, comb_sharpness=sharpness, comb_margin=margin,
+        epoch_s=epoch.shift_s,
         epoch_sigma=epoch.sigma, period_s=epoch.period_s, points=points,
         recovered=len(rows), frame_s=frame_s, nframes=capture.nframes,
-        seconds=capture.nframes * frame_s, slot_half_hz=half, rows=rows,
+        seconds=seconds, slot_half_hz=half, rows=rows,
         warnings=warnings, estimator=estimator, drift_hz_s=drift,
         visits=nvisits, combine=combine, settling_hz=settle,
-        settling_stderr_hz=settle_err, excess_scatter=excess)
+        settling_stderr_hz=settle_err, excess_scatter=excess,
+        cluster=cluster, cluster_centre_hz=centre_rf, centre_hz=centre_hz,
+        t_abs_s=t_abs_s + seconds / 2.0, **reduce_capture(rows))
 
 
 # ---------------------------------------------------------------------------
@@ -1307,6 +1552,129 @@ def synthesise(*, fs: float, centre_hz: float, seed: int = DEFAULT_SEED,
     return x.astype(np.complex64)
 
 
+
+# ---------------------------------------------------------------------------
+# the physical model the whole lever arm is about
+# ---------------------------------------------------------------------------
+# Three clocks are involved and only two of them can ever be separated:
+#
+#   f_rf(actual)  = f_rf(nominal) * (1 + d_tx)      the ADF5355's reference
+#   f_lo(actual)  = f_lo(nominal) * (1 + d_lnb)     the LNB's free-running LO
+#   everything the SDR reports is scaled by 1/(1 + d_rx)
+#
+# so what a capture actually shows is
+#
+#   reported_IF = ( f_rf(1+d_tx) - f_lo(1+d_lnb) ) / (1 + d_rx)  -  b(rx_lo)
+#
+# and since f_rf = f_IF + f_lo, the d_tx term splits into one piece that scales
+# with f_IF and one that does not -- exactly the two pieces d_rx and d_lnb
+# occupy. d_tx is therefore degenerate with both: what is measured is
+# (d_rx - d_tx) and (d_lnb - d_tx). Everything here is referred to the
+# transmitter's 125 MHz reference, and that has to be said out loud, because
+# "the SDR's clock error" is only meaningful against something.
+#
+# b(rx_lo) is the receiver's tuning-dependent bias -- 362 Hz peak to peak
+# across eight tunings on this hardware. It is a pure additive term: the LO
+# lands somewhere other than where it was asked to, and a tone's measured
+# frequency moves by exactly minus that amount regardless of where in the
+# passband the tone sits. That is why it cancels out of a within-capture
+# slope, and why it does NOT cancel out of the difference between two
+# captures at different clusters, which is the whole difficulty.
+
+def reported_if_hz(if_nom_hz, *, lo_hz: float, d_rx: float = 0.0,
+                   d_lnb: float = 0.0, d_tx: float = 0.0,
+                   tuning_bias_hz: float = 0.0, drift_hz_s: float = 0.0,
+                   t_rel_s: float = 0.0):
+    """What the receiver reports for a point whose nominal IF is ``if_nom_hz``.
+
+    Exact, not linearised: the cross term d_rx * d_lnb * f_LO is about 0.85 Hz
+    at the numbers this hardware actually has, which is twenty times the
+    per-capture precision the estimator now reaches.
+    """
+    if_nom = np.asarray(if_nom_hz, dtype=float)
+    f_rf = (if_nom + lo_hz) * (1.0 + d_tx)
+    f_lo = lo_hz * (1.0 + d_lnb) + drift_hz_s * t_rel_s
+    return (f_rf - f_lo) / (1.0 + d_rx) - tuning_bias_hz
+
+
+def synthesise_cluster(plan: ClusterPlan, cluster: int, *, fs: float,
+                       centre_hz: float, seed: int = DEFAULT_SEED,
+                       min_hop_s: float = DEFAULT_MIN_HOP_S,
+                       block: int = DEFAULT_BLOCK,
+                       jitter: float = DEFAULT_JITTER,
+                       period_cycles: int = DEFAULT_PERIOD_CYCLES,
+                       band_extra_s: float = DEFAULT_BAND_EXTRA_S,
+                       lo_hz: float = DEFAULT_LO_HZ, seconds: float = 2.0,
+                       start_at_s: float = 0.0, t_abs_s: float = 0.0,
+                       d_rx: float = 0.0, d_lnb: float = 0.0,
+                       d_tx: float = 0.0, drift_hz_s: float = 0.0,
+                       tuning_bias_hz: float = 0.0, snr_db: float = 10.0,
+                       noise_seed: int = 1, visit_phase: str = "random",
+                       settle_s: float = 0.0, settle_hz: float = 0.0,
+                       band_settle_s: float = 0.0, band_settle_hz: float = 0.0
+                       ) -> np.ndarray:
+    """The capture a receiver tuned to one cluster would take, answer known.
+
+    Only ``cluster``'s tones are put in the samples: the other clusters are
+    outside this tuning's passband, which is the whole reason the receiver has
+    to visit them one at a time. The schedule is the full multi-cluster one, so
+    the gaps where the transmitter is elsewhere are exactly where they will be
+    on the air.
+
+    ``band_settle_hz`` puts a much larger and slower settling error on the
+    dwells marked ``band_change`` -- the ones the synthesiser reaches by a VCO
+    band search. Those are the dwells the decoder discards, and injecting
+    something violent there is how that discard is tested rather than assumed.
+    """
+    if visit_phase not in ("random", "coherent"):
+        raise ValueError("visit_phase must be 'random' or 'coherent'")
+    if_nom = np.asarray(plan.if_nom(cluster, lo_hz), dtype=float)
+    span_s = start_at_s + seconds
+    per_cycle = plan.clusters * plan.points
+    cycles = max(period_cycles + 1,
+                 int(np.ceil(span_s / (min_hop_s * per_cycle))) + 2)
+    del per_cycle
+    hops = make_cluster_schedule(seed, plan, min_hop_s, cycles, block, jitter,
+                                 period_cycles, band_extra_s)
+
+    n = int(round(seconds * fs))
+    rng = np.random.default_rng(noise_seed)
+    sigma = 10.0 ** (-snr_db / 20.0) / np.sqrt(2.0)
+    x = (rng.standard_normal(n) + 1j * rng.standard_normal(n)) * sigma
+    # Frequency at the capture's own start, and the rate it walks at. The LNB
+    # drift enters the reported frequency divided by (1+d_rx), like everything
+    # else the receiver measures.
+    base = reported_if_hz(if_nom, lo_hz=lo_hz, d_rx=d_rx, d_lnb=d_lnb,
+                          d_tx=d_tx, tuning_bias_hz=tuning_bias_hz,
+                          drift_hz_s=drift_hz_s, t_rel_s=t_abs_s) - centre_hz
+    rate = -drift_hz_s / (1.0 + d_rx)          # Hz per second of capture time
+    tau = settle_s / 3.0 if settle_s > 0 else 0.0
+    tau_band = band_settle_s / 3.0 if band_settle_s > 0 else 0.0
+    for hop in hops:
+        if hop.cluster != cluster:
+            continue
+        if hop.end_s <= start_at_s or hop.start_s >= span_s:
+            continue
+        lo = max(0, int(np.ceil((hop.start_s - start_at_s) * fs)))
+        hi = min(n, int(np.ceil((hop.end_s - start_at_s) * fs)))
+        if hi <= lo:
+            continue
+        t0 = hop.start_s - start_at_s          # capture time this dwell starts
+        u = np.arange(lo, hi) / fs - t0        # time since the dwell started
+        f0 = base[hop.point] + rate * t0
+        # phase = 2 pi integral of (f0 + rate*u) du
+        phase = 2 * np.pi * (f0 * u + 0.5 * rate * u * u)
+        if visit_phase == "coherent":
+            phase += 2 * np.pi * base[hop.point] * t0
+        else:
+            phase += rng.uniform(0.0, 2 * np.pi)
+        hz, t_c = ((band_settle_hz, tau_band) if hop.band_change
+                   else (settle_hz, tau))
+        if t_c > 0 and hz:
+            phase += 2 * np.pi * hz * t_c * (1.0 - np.exp(-u / t_c))
+        x[lo:hi] += np.exp(1j * phase)
+    return x.astype(np.complex64)
+
 def write_int16(path, samples: np.ndarray, scale: float = 2000.0) -> int:
     """Write a complex array as interleaved little-endian int16, as a radio would."""
     out = np.empty(samples.size * 2, dtype="<i2")
@@ -1363,7 +1731,8 @@ def format_report(result: DecodeResult) -> str:
     lines = ["",
              f"  comb offset  : {result.comb_offset_hz/1e3:+.3f} kHz "
              f"(sharpness {result.comb_sharpness:.0f}x, "
-             f"floor {MIN_COMB_SHARPNESS:g}x)",
+             f"floor {MIN_COMB_SHARPNESS:g}x; margin over the nearest rival "
+             f"{result.comb_margin:.2f}x)",
              f"  epoch        : {result.epoch_s*1e3:.2f} ms of a "
              f"{result.period_s*1e3:.1f} ms period "
              f"(sigma {result.epoch_sigma:.1f}, floor {MIN_EPOCH_SIGMA:g})",
@@ -1462,6 +1831,33 @@ def build_parser() -> argparse.ArgumentParser:
                        help="permutations before the pattern repeats (default "
                             f"{DEFAULT_PERIOD_CYCLES}); bounds the epoch search")
 
+    clu = p.add_argument_group(
+        "clusters (a lever-arm run; --start-ghz and --points are then ignored)")
+    clu.add_argument("--clusters", type=int, default=0,
+                     help="decode one cluster of a multi-cluster schedule. "
+                          "0 (default) means the plain single-cluster hop")
+    clu.add_argument("--cluster", type=int, default=0,
+                     help="which cluster this capture holds")
+    clu.add_argument("--low-ghz", type=float, default=10.70,
+                     help="lowest cluster centre in GHz")
+    clu.add_argument("--high-ghz", type=float, default=11.90,
+                     help="highest cluster centre in GHz")
+    clu.add_argument("--cluster-points", type=int,
+                     default=DEFAULT_CLUSTER_POINTS,
+                     help="points per cluster, on a Golomb ruler")
+    clu.add_argument("--span-khz", type=float,
+                     default=DEFAULT_CLUSTER_SPAN_HZ / 1e3,
+                     help="how wide one cluster is, in kHz")
+    clu.add_argument("--block", type=int, default=DEFAULT_BLOCK,
+                     help="consecutive dwells per cluster visit")
+    clu.add_argument("--band-extra-ms", type=float,
+                     default=DEFAULT_BAND_EXTRA_S * 1e3,
+                     help="extra dwell on a band-changing hop, all of which "
+                          "the receiver skips")
+    clu.add_argument("--drop-band-change", action="store_true",
+                     help="discard band-changing dwells outright instead of "
+                          "skipping their allowance")
+
     rx = p.add_argument_group("receive chain")
     rx.add_argument("--lo-hz", type=float, default=DEFAULT_LO_HZ,
                     help="nominal LNB LO (default 9.75e9, low band)")
@@ -1536,16 +1932,35 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    start_hz = round(args.start_ghz * 1e9)
-    stop_hz = round(args.stop_ghz * 1e9)
     min_hop_s = args.min_hop_ms / 1e3
+    band_extra_s = args.band_extra_ms / 1e3
+    cluster_plan = None
+    if args.clusters:
+        cluster_plan = plan_clusters(
+            cluster_centres(args.low_ghz * 1e9, args.high_ghz * 1e9,
+                            args.clusters),
+            args.cluster_points, round(args.span_khz * 1e3))
+        freqs = cluster_plan.freqs(args.cluster)
+        start_hz, stop_hz = freqs[0], freqs[-1]
+        hops = make_cluster_schedule(args.seed, cluster_plan, min_hop_s,
+                                     args.period_cycles + 1, args.block,
+                                     args.jitter, args.period_cycles,
+                                     band_extra_s)
+        print(describe_clusters(cluster_plan, hops, args.seed, min_hop_s,
+                                args.block, args.lo_hz, args.period_cycles,
+                                band_extra_s))
+        print(f"  decoding : cluster {args.cluster} of {cluster_plan.clusters}"
+              f", centred {cluster_plan.centres_hz[args.cluster]/1e9:.4f} GHz")
+    else:
+        start_hz = round(args.start_ghz * 1e9)
+        stop_hz = round(args.stop_ghz * 1e9)
+        freqs = plan_frequencies(start_hz, stop_hz, args.points)
+        hops = make_schedule(args.seed, freqs, min_hop_s,
+                             args.period_cycles + 1, args.jitter,
+                             args.period_cycles)
+        print(describe(hops, freqs, args.seed, min_hop_s, args.jitter))
     centre = (args.if_hz if args.if_hz is not None
               else (start_hz + stop_hz) / 2 - args.lo_hz - args.lo_error_hz)
-
-    freqs = plan_frequencies(start_hz, stop_hz, args.points)
-    hops = make_schedule(args.seed, freqs, min_hop_s, args.period_cycles + 1,
-                         args.jitter, args.period_cycles)
-    print(describe(hops, freqs, args.seed, min_hop_s, args.jitter))
     print(f"\n  tuning   : {centre/1e6:.3f} MHz at {args.fs/1e6:g} MS/s "
           f"({args.fs*0.8/1e6:.2f} MHz usable, span "
           f"{(stop_hz-start_hz)/1e6:.3f} MHz)")
@@ -1556,13 +1971,26 @@ def main(argv: list[str] | None = None) -> int:
                   start_hz=start_hz, stop_hz=stop_hz, points=args.points,
                   min_hop_s=min_hop_s, jitter=args.jitter,
                   period_cycles=args.period_cycles, lo_hz=args.lo_hz)
+    if cluster_plan is not None:
+        common |= dict(cluster_plan=cluster_plan, cluster=args.cluster,
+                       block=args.block, band_extra_s=band_extra_s,
+                       drop_band_change=args.drop_band_change)
 
     tmp_path = None
     if args.self_test:
         print("\n  SELF TEST: synthesising a capture, nothing is transmitted "
               "and no radio is opened")
-        source = synthesise(seconds=min(args.seconds, 1.0), offset_hz=-106e3,
-                            start_at_s=0.0371, **common)
+        if cluster_plan is not None:
+            source = synthesise_cluster(
+                cluster_plan, args.cluster, fs=args.fs, centre_hz=centre,
+                seed=args.seed, min_hop_s=min_hop_s, block=args.block,
+                jitter=args.jitter, period_cycles=args.period_cycles,
+                band_extra_s=band_extra_s, lo_hz=args.lo_hz,
+                seconds=min(args.seconds, 2.0), start_at_s=0.0371,
+                d_rx=8.94e-6, d_lnb=DEFAULT_LO_ERROR_HZ / args.lo_hz)
+        else:
+            source = synthesise(seconds=min(args.seconds, 1.0),
+                                offset_hz=-106e3, start_at_s=0.0371, **common)
     elif args.capture:
         source = args.capture
         size = os.path.getsize(source)

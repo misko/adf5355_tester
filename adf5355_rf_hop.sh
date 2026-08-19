@@ -42,6 +42,7 @@ PERIOD_CYCLES="${PERIOD_CYCLES:-1}"   # permutations before the pattern repeats
 CYCLES="${CYCLES:-300}"               # permutations to transmit: 300 x 200 ms
 POWER="${POWER:-0}"                   # 0 = -4 dBm, the lowest step
 CHANNEL="${CHANNEL:-B}"               # B = 6.8-13.6 GHz doubler output (OB)
+SPI_HZ="${SPI_HZ:-1000000}"           # SPI clock; a hop is three register writes
 # ---------------------------------------------------------------------------
 
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"

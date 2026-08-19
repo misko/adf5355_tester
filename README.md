@@ -131,8 +131,9 @@ adf5355 probe                                   # is the chip receiving writes?
 adf5355 dump   --freq 2.4G                      # registers, no hardware touched
 adf5355 set    --freq 2.4G --enable-rf --hold 5
 adf5355 dwell  --freq 2.4G --dwell 30 --enable-rf
-adf5355 hop    --enable-rf                      # seeded pseudorandom hop
-adf5355 ladder --enable-rf                      # duration-coded (superseded)
+adf5355 hop       --enable-rf                   # seeded pseudorandom hop
+adf5355 hop-lever --enable-rf                   # the same, over a 1.2 GHz lever arm
+adf5355 ladder    --enable-rf                   # duration-coded (superseded)
 adf5355 sweep  --start 1G --stop 6G --points 51
 adf5355 off
 ```
@@ -144,6 +145,7 @@ adf5355 off
 | `set` | Programs one frequency, optionally holding it with `--hold`. |
 | `dwell` | Transmits one frequency for `--dwell` seconds, then mutes and exits. |
 | `hop` | Seeded pseudorandom frequency hop — the recommended calibration pattern, see below. |
+| `hop-lever` | The same schedule spread over several widely separated clusters, so a receiver can separate its own clock error from the LNB's LO error. See [The frequency lever arm](#the-frequency-lever-arm-separating-d_rx-from-d_lnb). |
 | `ladder` | Duration-coded ladder — superseded by `hop`, see below. |
 | `sweep` | Steps a range and checks lock at every point. Exits non-zero if any point fails. |
 | `off` | Disables both outputs. |
@@ -549,14 +551,293 @@ python3 tools/hop_decode.py --capture run.iq --frame 1024 --json
 
 The receiver's clock error is the *slope* of Δf against frequency, so separating
 it from the LNB's LO error needs frequency span. Across 1.71 MHz a 9 ppm clock
-error moves Δf by about 15 Hz, far under the receiver's tuning-dependent
-systematic. One hop run therefore measures the total offset at one frequency
-very precisely, but cannot split it into its two causes. To get both, run the
-same hop at several widely separated centres — say 10.7, 11.1 and 11.5 GHz —
-and fit the precise local offsets against frequency; the spread across centres
-restores the lever arm. See
-[Using the ladder to measure a receiver's clock offset](#using-the-ladder-to-measure-a-receivers-clock-offset)
-for the algebra, which is unchanged.
+error moves Δf by about 15 Hz. One hop run therefore measures the total offset
+at one frequency very precisely, but cannot split it into its two causes.
+
+That is what the next section is for: the same seeded schedule, spread over
+clusters more than a gigahertz apart in IF, fitted together.
+See [The frequency lever arm](#the-frequency-lever-arm-separating-d_rx-from-d_lnb).
+
+---
+
+## The frequency lever arm: separating d_rx from d_lnb
+
+A single narrow cluster measures the receiver's total offset superbly and
+**cannot take it apart**. Writing `d` for a fractional frequency error, what a
+capture sees is
+
+```
+Δf(f_IF) = -d_rx · f_IF  -  d_lnb · f_LO_nom  -  b(rx_lo)  -  drift(t)
+           \___________/   \_______________/   \________/   \________/
+            scales with     constant in Hz      tuning       LNB warming
+            the IF                              bias         up
+```
+
+Across one 720 kHz cluster the first term moves by 6 Hz for a 9 ppm clock. The
+number that comes out is therefore precise and is a *blend*. Splitting it needs
+frequency span, and the LNB low band supplies it: RF 10.7–11.9 GHz is IF
+0.95–2.15 GHz, so between the outermost clusters the first term moves by
+**10.7 kHz**. That is the lever arm, and everything below exists to use it
+without letting the retuning it requires eat the answer.
+
+```bash
+./adf5355_rf_lever.sh                  # transmit: hop over every cluster, forever
+OPEN_RADIO=1 ./sdr_lever.sh            # receive: visit each cluster, many times, fit
+tools/lever_fit.py lever-run.jsonl     # re-fit a saved run without re-capturing
+```
+
+### The transmitted schedule
+
+One seeded schedule covers every cluster, and **a receiver tuned to any one of
+them sees a complete, decodable pattern for that cluster and needs none of the
+others**. Four properties make that work.
+
+| | |
+|---|---|
+| **Rounds** | Every cluster is visited once per round, in an order redrawn each round. No cluster is starved, and none sits at a fixed phase of the period — which is what would let the LNB's drift correlate with which cluster is being heard. |
+| **Blocks** | Dwells come in blocks of consecutive same-cluster points, so only the first dwell of a block changes VCO band. Within a cluster the span is under a megahertz, well inside one band, so the rest hop with dividers alone exactly as the single-cluster schedule always has. |
+| **A longer dwell where the band changes** | That first dwell is `--band-extra-ms` longer, and the receiver skips exactly the extra. Every measured window is then the same length whether or not the band moved, no point is ever lost, and "was the allowance enough?" stops being a judgement call — the half-split check answers it. |
+| **A Golomb ruler, not a grid** | The points inside a cluster are **not** evenly spaced. See below; this one is not cosmetic. |
+
+The period is one whole cycle — every cluster's every point, once. With C
+clusters a receiver hears its own cluster 1/C of the time; that duty factor is
+the price of the lever arm and is unavoidable with one transmitter. The fix is
+simply to listen C times as long.
+
+### Why the points are not evenly spaced
+
+Slide a uniformly spaced comb of P points by one spacing and P−1 of its points
+land on neighbours. The receiver's comb search then has a rival peak scoring
+(P−1)/P of the truth, one whole spacing away — and taking that rival
+**mislabels every point and returns a confident answer wrong by a spacing**.
+This is not hypothetical: it happened, on synthetic captures, to a four-point
+cluster whose alias scored 3/4.
+
+The points therefore sit on an optimal **Golomb ruler** scaled to the cluster
+span. Every pairwise difference is distinct, so no shift can realign more than
+one pair and the best alias scores 1/P. The decoder reports the measured
+margin over the nearest rival peak beside the old peak-over-median sharpness,
+and judges it against what the frequency plan itself allows — a uniform comb is
+not condemned for an ambiguity it cannot help, and an aperiodic one is not
+excused for losing a margin it should have had.
+
+The price is that a Golomb ruler of P marks is longer than P−1 units, so for a
+fixed span the closest pair shrinks as the ruler's length. That is what bounds
+the useful points per cluster: at 720 kHz of span, **six points leave 42 kHz**
+between the closest pair, while twelve would leave 8 kHz — under two FFT bins,
+too close to separate. More points is not the route to more precision here
+anyway: the total time on air per cluster is what sets it, and splitting that
+among more points only makes each one shorter.
+
+### The tuning bias is the whole problem
+
+The same unmoving tone, measured from eight different `rx_lo` settings, spanned
+**362 Hz** on this hardware — about 127 Hz sd. That bias is additive and
+constant across one capture: it cancels out of anything measured *inside* a
+capture, and it does not cancel at all between captures at different clusters,
+which is exactly the contrast the lever arm is made of. Left alone it would put
+√2 × 127 / 1.2 GHz ≈ **0.15 ppm** on d_rx — only twice better than the ±0.3 ppm
+the single-cluster method already quotes, and the whole exercise would be
+pointless.
+
+Four things are done about it, in order of importance.
+
+1. **Dither the tuning.** Every capture is taken at an `rx_lo` drawn at random
+   from a ±450 kHz window. Whether the bias is a deterministic function of the
+   requested LO or a fresh draw on every retune — and that cannot be told from
+   outside — dithering makes it an independent draw per capture, so N captures
+   of one cluster average it down as √N. **Without the dither, retuning to the
+   same number reproduces the same bias and more captures buy nothing.**
+2. **Many short captures rather than few long ones.** The bias per capture does
+   not care how long the capture is, and it is about 8000× larger than the
+   estimator's noise (127 Hz against 0.015 Hz measured on a 3 s synthetic
+   capture). Precision tracks the **number** of captures, not the total
+   listening time. Three seconds is enough to decode; longer is spent buying
+   precision that is already free.
+3. **Measure it rather than assume it.** The scatter of one cluster's captures
+   about the fit *is* the tuning bias, so its size is estimated from the run as
+   a variance component and fed into the answer. And the **variogram** — that
+   scatter as a function of how far apart the two tunings were — says whether
+   the dither is really decorrelating it. A flat variogram is the evidence that
+   the √N is being earned; one that rises with separation means nearby tunings
+   agree, the bias is smooth across the dither window, and the run says so.
+4. **Resample, do not trust a covariance.** Every uncertainty quoted comes from
+   refitting resampled data.
+
+### Drift, and why d_rx and d_lnb are fitted differently
+
+The LNB LO walks about 4.5 Hz/s, so over a ten-minute run it moves by
+kilohertz — far more than the tuning bias. Captures are therefore taken in
+**sweeps**: one capture of every cluster, in a fresh order each time.
+
+* **d_rx** is fitted with a **free offset per sweep**. That absorbs the LNB's LO
+  error, its drift, and any other purely time-dependent common term, *of any
+  shape*, exactly. d_rx survives because it is the only term that varies with
+  IF and every sweep holds every cluster. Injecting a 3 kHz exponential warm-up
+  — a curve no polynomial follows — leaves under 0.01 ppm on d_rx.
+* A **within-sweep drift slope** is fitted as well. A sweep takes about a
+  minute and 4.5 Hz/s is 200 Hz across one, which a free constant does not
+  touch; it aliases onto whichever cluster was visited early against late. The
+  visit order is a **cyclic Latin square** so that imbalance is zero by
+  construction, and the slope removes whatever is left. Both defences are
+  aimed at the same 0.02 ppm, which is the size of the whole answer. Without
+  them a 120-run study showed a real +0.008 ppm bias; with them, +0.001 ppm.
+* **d_lnb** cannot be fitted that way — it *is* a constant in Hz, so free
+  per-sweep offsets would swallow it. It is fitted instead against an explicit
+  smooth drift in time, and its uncertainty is dominated by that model choice.
+  It is also only meaningful at an instant, since the thing being measured is
+  moving at 4.5 Hz/s; the report says which instant and at what rate.
+
+### The narrow lever, as an independent witness
+
+Each capture also yields a slope across its own cluster — 720 kHz instead of
+1.2 GHz. A thousand times less lever arm, but **no tuning bias at all** (a
+constant offset cancels exactly out of a slope), no dependence on the drift
+model, and on a 3 s synthetic capture it measures d_rx to ±0.01–0.07 ppm on its
+own. It is reported and compared, and by default **not folded into the answer**.
+
+That is a considered position. The narrow lever is far tighter than the wide
+one, so combining would hand it the answer; and the only evidence it is
+unbiased is that the two agree — evidence good to about the wide lever's own
+precision. Quoting an uncertainty smaller than that would be quoting an
+assumption. `--narrow combine` does it anyway for anyone who accepts that
+nothing but the sample clock can tilt a slope measured inside one capture;
+`--narrow off` ignores it. What the default buys is a check that can fail: if
+something in the receiver depends on baseband frequency, or the dither is not
+randomising the tuning bias, the two levers disagree and the run says so.
+
+### Uncertainty, and what it is dominated by
+
+Nothing here quotes a covariance standard error. The decoder's own standard
+errors are the *estimator's* — hundredths of a hertz — while the scatter that
+governs the answer is the tuning bias at a hundred hertz, which is not in that
+number at all. A covariance built on the former understates the answer's
+uncertainty by **more than tenfold**, and there is a test that asserts exactly
+that.
+
+Instead: a **bootstrap over sweeps** and a **leave-one-sweep-out jackknife**,
+with the larger of the two quoted. The sweep is the resampling unit because it
+is the exchangeable one — every sweep holds every cluster, its captures share a
+moment in the LNB's warm-up and nothing else, and each carries its own
+independent draw of the tuning bias.
+
+**Expected tolerance.** With σ_b the tuning bias, S sweeps and clusters at IFs
+x_c,
+
+```
+σ(d_rx) = σ_b / sqrt( S · Σ_c (x_c − x̄)² )
+```
+
+which for 127 Hz, four clusters evenly spread over 0.95–2.15 GHz, is
+**0.142 / √S ppm**:
+
+| sweeps | captures | run time | σ(d_rx) predicted | measured | σ(d_lnb) measured |
+|---:|---:|---:|---:|---:|---:|
+| 10 | 40 | ~6 min | 0.045 ppm | 0.043 ppm | 74 Hz on 9.75 GHz |
+| 25 | 100 | ~15 min | 0.028 ppm | 0.028 ppm | 49 Hz |
+| 50 | 200 | ~30 min | 0.020 ppm | 0.023 ppm | 39 Hz |
+
+"Measured" is the true scatter over 120 synthetic runs at each size, against
+the σ the resample quoted: it agreed to 1% at 10 and 25 sweeps and was 14%
+optimistic at 50, and the nominal 95% interval covered 88–93%. So **treat the
+quoted 1σ as good to about 15%**. Below 8 sweeps a resample over sweeps has too
+few blocks to be believed at all — at 5 sweeps the interval covered only 71% —
+which is why the run refuses to be trusted below `MIN_SWEEPS`.
+
+Against the ±0.3 ppm the single-cluster method quotes today, a fifteen-minute
+run is **about eleven times tighter**, and the improvement keeps going as √N
+until something in the "not in the budget" list below becomes the limit.
+
+**The dominant term is the receiver's tuning bias, by a very long way.** In a
+25-sweep run it contributes 0.028 ppm, against 0.000004 ppm from the frequency
+estimator (0.015 Hz per capture over the same lever), 0.0000001 ppm from the
+ADF5355's own frequency plan (worst point 0.43 mHz from nominal across the
+whole lever arm), and 0.0001 ppm from the exact-versus-linearised inversion,
+which is done exactly anyway. Everything except the tuning bias is
+five or more orders of magnitude down.
+
+What is *not* in that budget, because no resample can see it:
+
+* **A response that curves with frequency.** An LNB band edge, a filter, a
+  reflection: a bias, not a scatter. The per-cluster residuals are printed and a
+  χ² on them fails the run.
+* **A tuning bias that the dither does not randomise.** The variogram is the
+  check, and it fails the run too.
+* **The Pluto's own reference moving during the run.** The fit assumes one
+  d_rx; the split-half comparison is the check, and a difference well outside
+  the quoted uncertainty fails the run. Let the radio reach thermal steady
+  state first.
+* **d_tx.** Three clocks are involved and only two can be separated. Since
+  f_RF = f_IF + f_LO, a transmitter reference error splits into one piece
+  scaling with f_IF and one that does not — exactly the two slots d_rx and
+  d_lnb occupy. **What is measured is (d_rx − d_tx) and (d_lnb − d_tx):
+  everything is referred to the transmitter's 125 MHz reference.** That has to
+  be said out loud, because "the SDR's clock error" only means something
+  against something else.
+
+### Running it on the bench
+
+```bash
+# 1. Transmit. Leave it running for the whole receiver run.
+#    CLOSED PATH ONLY -- coax into an attenuator and a load. No antenna.
+./adf5355_rf_lever.sh
+
+# 2. Sanity-check one cluster before committing to a long run.
+#    This is one capture, decoded and printed in full.
+tools/hop_decode.py --clusters 4 --cluster 0 --seconds 3 --capture-out /tmp/c0.iq
+tools/hop_decode.py --clusters 4 --cluster 3 --seconds 3
+
+# 3. The run itself.
+OPEN_RADIO=1 SWEEPS=25 OUT=lever-run.jsonl ./sdr_lever.sh
+
+# 4. Re-fit later, as often as you like, without re-capturing.
+tools/lever_fit.py lever-run.jsonl --json
+tools/lever_fit.py lever-run.jsonl --narrow combine   # see what the assumption buys
+```
+
+Before step 3, check step 2's report for three things. **`margin over the
+nearest rival`** measured 4.3–4.7× for six points on synthetic captures at
+10 dB, against a geometric ceiling of 6× — near 1× means the comb search
+cannot tell the right comb from a shifted copy, and the decoder fails the
+capture for it. **`dwell halves`** should be zero within its own error bar; if it
+is not, raise `BAND_EXTRA_MS` until it is, because that is the VCO band search
+leaking into the measurement. **`vs the bound`** should be near 1×; far above
+means something unmodelled is moving and the precision is not the accuracy.
+
+Let the Pluto reach thermal steady state before starting. The fit assumes one
+d_rx for the whole run and the split-half check will say so if that is wrong,
+but a run that has to be thrown away is an expensive way to find out.
+
+### The transmitter runs from Python, not from `tools/hop_tx`
+
+The C transmitter's plan format carries one fixed dwell and one register triple
+per point, written with no VCO band search. A cluster schedule needs neither of
+those: band-changing dwells are longer than the rest, and they need a real
+retune with the band search or the loop simply does not lock across a
+1.2 GHz step. So `adf5355 hop-lever` drives this one, from Python, with the
+collector paused for the duration.
+
+That is comfortable here. The hop rate is 100/s against the 1600/s the C path
+was built for, the measured scheduling jitter with the collector off is under
+4 µs, and each cycle needs only `clusters × points / block` band searches — a
+tenth of the hops. If the C transmitter is ever wanted for this, it needs a
+per-hop dwell field and an autocal register set, and `emit_hop_plan.py` needs
+to emit both.
+
+### Verifying the whole chain with no hardware
+
+Every layer has an offline path, and they are the same code the radio uses.
+
+```bash
+tools/lever_fit.py --self-test          # synthesise a run, recover d_rx and d_lnb
+tools/lever_run.py                      # print the visit plan, open nothing
+tools/lever_run.py --synthetic --sweeps 12 --out /tmp/fake.jsonl --fit
+SYNTHETIC=1 ./sdr_lever.sh              # the same, through the operator script
+```
+
+`--synthetic` builds every capture in memory from an injected d_rx, d_lnb,
+drift and per-capture tuning bias, then runs the identical decode and fit. There
+is no separate offline code path to rot.
 
 ---
 
@@ -896,7 +1177,10 @@ attached.
 | `adf5355/entry.py` | Process entry point and shutdown handling |
 | `adf5355_ladder.py` | Original standalone bench script, kept as a reference |
 | `tools/hop_decode.py` | Receive end: capture, find the comb, align the epoch, measure |
-| `adf5355_rf_hop.sh` / `sdr_listen.sh` | The two ends of a hop calibration, one command each |
+| `tools/lever_run.py` | Drives a whole lever-arm run: visit every cluster, many times, record each capture |
+| `tools/lever_fit.py` | Combines those captures into d_rx and d_lnb separately, with resampled uncertainties |
+| `adf5355_rf_hop.sh` / `sdr_listen.sh` | The two ends of a single-cluster hop calibration, one command each |
+| `adf5355_rf_lever.sh` / `sdr_lever.sh` | The two ends of a lever-arm calibration, one command each |
 
 ### Frequency solving
 
@@ -920,9 +1204,10 @@ the residual is real rather than a float artifact.
 python3 -m unittest discover -s tests -t .
 ```
 
-238 tests, no hardware required — including the hop decoder, which is exercised
-against synthetic captures carrying a planted comb offset and a planted epoch.
-The register images are checked three ways:
+343 tests, no hardware required — including the hop decoder, which is exercised
+against synthetic captures carrying a planted comb offset and a planted epoch,
+and the whole lever arm, which is exercised against synthetic multi-cluster runs
+carrying a planted d_rx and d_lnb. The register images are checked three ways:
 
 1. **`tests/test_registers.py`** — the bitfield table itself: no field overlaps
    another, collides with reserved bits, or corrupts the address nibble.
@@ -960,6 +1245,27 @@ Two more guard the calibration rather than the registers:
    actually passed through to the tool it drives, and that both agree with the
    package defaults. Drift between the two ends is the failure the whole design
    guards against, so it is checked mechanically rather than by eye.
+6. **`tests/test_lever_arm.py`** — the whole multi-cluster measurement, at two
+   levels. The complete chain (synthesised I/Q → cluster decoder → fit) is run
+   on a small but complete four-cluster, six-sweep run and asserted to return
+   **both** d_rx and d_lnb, with and without LNB drift and with and without a
+   per-capture tuning bias. The fit alone is then hammered on runs synthesised
+   directly as records, where a hundred captures cost a millisecond and every
+   error source can be injected one at a time.
+
+   The failures that get asserted are the *silent* ones. A per-cluster offset
+   must trip the linearity check; a tilted within-capture slope must trip the
+   two-lever comparison; a tuning bias that varies smoothly with tuning must
+   trip the variogram; a clock that moves halfway through must trip the
+   split-half. A covariance built on the decoder's own standard errors is
+   asserted to understate the answer's uncertainty by more than tenfold, which
+   is why the resample exists. The bootstrap interval's coverage is measured
+   rather than assumed. And the schedule itself is checked: every (cluster,
+   point) once per cycle, band changes only at block boundaries, every cluster
+   in every round, the points a Golomb ruler with distinct differences, and a
+   fake device that records which hops got a VCO band search and which did not.
+   `adf5355_rf_lever.sh` and `sdr_lever.sh` are parsed and cross-checked the
+   same way the single-cluster pair are, safety banners included.
 
 ### Known defects in the Analog Devices reference
 

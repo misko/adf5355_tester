@@ -24,11 +24,15 @@ from .ladder import (make_ladder, format_ladder, run_ladder,
                      overlaps_satellite_band, check_schedule_feasible,
                      DEFAULT_START_HZ, DEFAULT_STOP_HZ, DEFAULT_STEPS,
                      DEFAULT_TOTAL_S)
-from .hopper import (DEFAULT_CYCLES, DEFAULT_HOP_START_HZ,
+from .hopper import (DEFAULT_BAND_EXTRA_S, DEFAULT_BLOCK,
+                     DEFAULT_CLUSTER_POINTS, DEFAULT_CLUSTER_SPAN_HZ,
+                     DEFAULT_CYCLES, DEFAULT_HOP_START_HZ,
                      DEFAULT_HOP_STOP_HZ, DEFAULT_JITTER, DEFAULT_MIN_HOP_S,
                      DEFAULT_PERIOD_CYCLES, DEFAULT_POINTS, DEFAULT_SEED,
-                     describe as describe_hops, make_schedule,
-                     plan_frequencies, run_hops)
+                     cluster_centres, describe as describe_hops,
+                     describe_clusters, make_cluster_schedule, make_schedule,
+                     period_duration, plan_clusters, plan_frequencies,
+                     run_hops)
 from .plan import Channel, SynthConfig, plan
 from .registers import MuxOut, OutputPower
 
@@ -329,6 +333,100 @@ def cmd_hop(args) -> int:
     return 0
 
 
+def cmd_hop_lever(args) -> int:
+    """Cluster hopping: the same seeded schedule, over a real frequency lever arm.
+
+    One narrow cluster measures the receiver's total offset precisely and
+    cannot say how much of it is the SDR's clock and how much is the LNB's LO.
+    Spreading the same schedule over clusters hundreds of megahertz apart is
+    what separates them, because only the SDR's clock error scales with the
+    intermediate frequency.
+
+    The transmitter is free-running and knows nothing about the receiver: it
+    hops over every cluster forever, and a receiver tuned to any one of them
+    sees a complete, decodable pattern for that cluster alone.
+    """
+    channel = resolve_channel(args)
+    enable = args.enable_rf
+    try:
+        centres = cluster_centres(args.low_ghz * 1e9, args.high_ghz * 1e9,
+                                  args.clusters)
+        plan_c = plan_clusters(centres, args.cluster_points,
+                               round(args.span_khz * 1e3))
+        hops = make_cluster_schedule(args.seed, plan_c, args.min_hop_ms / 1e3,
+                                     args.cycles, args.block, args.jitter,
+                                     args.period_cycles,
+                                     args.band_extra_ms / 1e3)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    # Within a cluster the span is well under a megahertz, so those hops stay
+    # inside one VCO band and are written as dividers only. Cluster changes
+    # get a full retune with the band search; mute-till-lock would blank the
+    # dwell while that runs, so it stays off and the schedule pays for the
+    # settling with a longer dwell instead.
+    args.no_mute_till_lock = True
+    config = build_config(args, enable and channel is Channel.A,
+                          enable and channel is Channel.B)
+    freqs = plan_c.all_freqs
+    worst = 0.0
+    for freq in freqs:
+        try:
+            p = plan(config, freq, channel)
+        except ValueError as exc:
+            print(f"error: {freq/1e9:.6f} GHz: {exc}", file=sys.stderr)
+            return 2
+        worst = max(worst, abs(float(p.solution.error_hz)))
+
+    per_cycle = plan_c.clusters * plan_c.points
+    print(describe_clusters(plan_c, hops, args.seed, args.min_hop_ms / 1e3,
+                            args.block, args.lo_hz, args.period_cycles,
+                            args.band_extra_ms / 1e3))
+    print(f"  plan error: worst point is {worst*1e3:.4f} mHz from nominal "
+          f"across the whole lever arm")
+    print(f"  run time  : {hops[-1].end_s:.1f} s total over {args.cycles} "
+          f"cycles -- leave this running for the whole receiver run")
+    print(f"\n  the receiver needs only: seed 0x{args.seed:X}, "
+          f"{args.low_ghz}-{args.high_ghz} GHz in {args.clusters} clusters, "
+          f"{args.cluster_points} points over {args.span_khz:g} kHz, "
+          f"hop {args.min_hop_ms:g} ms, block {args.block}, band-extra "
+          f"{args.band_extra_ms:g} ms, period-cycles {args.period_cycles}")
+
+    lo, hi = min(freqs), max(freqs)
+    if lo <= SATBAND_HI_HZ and hi >= SATBAND_LO_HZ:
+        print("\nSAFETY: overlaps the 10.7-12.7 GHz satellite downlink band. "
+              "Closed, attenuated path only; do not radiate.")
+    else:
+        print("\nSAFETY: bench equipment. Do not connect an antenna.")
+
+    if not enable:
+        print("\nRF disabled, so nothing was transmitted. Re-run with "
+              "--enable-rf into a shielded/attenuated path.")
+        return 0
+
+    autocal_plans = {f: plan(config, f, channel) for f in freqs}
+    dev = open_device(args, config)
+    try:
+        dev.set_frequency(hops[0].freq_hz, channel)
+        if dev.can_detect_lock and not args.no_lock_check:
+            try:
+                waited = dev.wait_for_lock(args.lock_timeout)
+                print(f"  locked in {waited*1e3:.1f} ms")
+            except LockTimeout as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
+        start = time.monotonic()
+        run_hops(dev, hops, channel, autocal_plans=autocal_plans)
+        elapsed = time.monotonic() - start
+    finally:
+        dev.close()
+    print(f"\ntransmitted {len(hops)} hops in {elapsed:.4f} s "
+          f"(scheduled {hops[-1].end_s:.4f} s, "
+          f"error {(elapsed - hops[-1].end_s)*1e3:+.1f} ms); output muted")
+    return 0
+
+
 def cmd_sweep(args) -> int:
     channel = resolve_channel(args)
     config = build_config(args, args.enable_rf and channel is Channel.A,
@@ -513,6 +611,62 @@ def build_parser() -> argparse.ArgumentParser:
                      help=f"permutations to transmit (default "
                           f"{DEFAULT_CYCLES})")
     hop.set_defaults(func=cmd_hop, channel_default="B")
+
+    lev = sub.add_parser("hop-lever", parents=[common],
+                         help="seeded hopping over several widely separated "
+                              "clusters, so a receiver can separate its own "
+                              "clock error from the LNB's LO error")
+    lev.add_argument("--seed", type=lambda v: int(v, 0), default=DEFAULT_SEED,
+                     help=f"shared schedule seed (default 0x{DEFAULT_SEED:X})")
+    lev.add_argument("--low-ghz", type=float, default=10.70,
+                     help="lowest cluster centre in GHz (default 10.70, the "
+                          "bottom of the LNB low band)")
+    lev.add_argument("--high-ghz", type=float, default=11.90,
+                     help="highest cluster centre in GHz (default 11.90); the "
+                          "gap between these two IS the lever arm")
+    lev.add_argument("--clusters", type=int, default=4,
+                     help="how many clusters to spread across that range "
+                          "(default 4). More gives a linearity check; fewer "
+                          "gives each one more of the air time")
+    lev.add_argument("--cluster-points", type=int,
+                     default=DEFAULT_CLUSTER_POINTS,
+                     help=f"points per cluster (default "
+                          f"{DEFAULT_CLUSTER_POINTS})")
+    lev.add_argument("--span-khz", type=float,
+                     default=DEFAULT_CLUSTER_SPAN_HZ / 1e3,
+                     help=f"how wide one cluster is, in kHz (default "
+                          f"{DEFAULT_CLUSTER_SPAN_HZ/1e3:g}). The points sit "
+                          f"on a Golomb ruler inside it, not on a regular "
+                          f"grid. The whole cluster must fit the receiver's "
+                          f"passband with room left over for its tuning "
+                          f"dither")
+    lev.add_argument("--min-hop-ms", type=float,
+                     default=DEFAULT_MIN_HOP_S * 1e3,
+                     help=f"dwell in ms (default {DEFAULT_MIN_HOP_S*1e3:g})")
+    lev.add_argument("--block", type=int, default=DEFAULT_BLOCK,
+                     help=f"consecutive dwells per cluster visit (default "
+                          f"{DEFAULT_BLOCK}); must divide --cluster-points. "
+                          f"Only the first dwell of a block changes band")
+    lev.add_argument("--band-extra-ms", type=float,
+                     default=DEFAULT_BAND_EXTRA_S * 1e3,
+                     help=f"how much longer a band-changing dwell is, to pay "
+                          f"for the VCO band search (default "
+                          f"{DEFAULT_BAND_EXTRA_S*1e3:g} ms). The receiver "
+                          f"skips exactly this much and reports whether it "
+                          f"was enough")
+    lev.add_argument("--jitter", type=float, default=DEFAULT_JITTER)
+    lev.add_argument("--period-cycles", type=int,
+                     default=DEFAULT_PERIOD_CYCLES,
+                     help="cycles before the pattern repeats; bounds the "
+                          "receiver's epoch search")
+    lev.add_argument("--cycles", type=int, default=8000,
+                     help="cycles to transmit (default 8000, about an hour); "
+                          "must outlast the whole receiver run, which is "
+                          "minutes per sweep")
+    lev.add_argument("--lo-hz", type=float, default=9.75e9,
+                     help="nominal LNB LO, printed so both ends agree on what "
+                          "IF each cluster lands at")
+    lev.set_defaults(func=cmd_hop_lever, channel_default="B")
 
     lad = sub.add_parser("ladder", parents=[common],
                          help="duration-coded ladder: rung n transmits for "

@@ -176,16 +176,29 @@ class ADF5355:
         self._current = p
         return p
 
-    def retune(self, p: Plan) -> Plan:
+    def retune(self, p: Plan, autocal: bool = True) -> Plan:
         """Frequency change on an already-initialized part.
 
         Shorter than a cold start but still ordered: the counter reset brackets
         the divider update, R0 is written once without autocal to load the new
         dividers, then again with autocal to recalibrate the VCO band.
+
+        ``autocal=False`` skips the VCO band search entirely and writes the new
+        dividers only. That is valid when the step is small enough to stay
+        inside the current band, and it is dramatically faster -- no ADC settle
+        wait, no re-lock, and no mute-till-lock blanking. For frequency hopping
+        across a span far narrower than a VCO band it is the difference between
+        a usable dwell and one spent mostly muted.
         """
         if not self._synced:
             return self.program(p)
         words = p.words
+        if not autocal:
+            self._write(1, words[1])
+            self._write(2, words[2])
+            self._write(0, words[0] & ~_AUTOCAL.mask)
+            self._current = p
+            return p
         self._write(10, words[10])
         self._write(6, words[6])
         self._write(4, words[4] | _COUNTER_RESET.encode(1))
@@ -198,10 +211,10 @@ class ADF5355:
         self._current = p
         return p
 
-    def set_frequency(self, freq_hz: int,
-                      channel: Channel = Channel.A) -> Plan:
+    def set_frequency(self, freq_hz: int, channel: Channel = Channel.A,
+                      autocal: bool = True) -> Plan:
         p = build_plan(self.config, freq_hz, channel)
-        return self.retune(p) if self._synced else self.program(p)
+        return self.retune(p, autocal) if self._synced else self.program(p)
 
     # --- output gating ------------------------------------------------------
     def _rewrite_r6(self, mutate) -> None:

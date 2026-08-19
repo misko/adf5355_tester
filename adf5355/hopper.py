@@ -113,27 +113,47 @@ def _permutation(rng: SplitMix64, n: int) -> list[int]:
 
 
 def make_schedule(seed: int, freqs: list[int], min_hop_s: float,
-                  cycles: int, jitter: float = DEFAULT_JITTER) -> list[Hop]:
-    """Regenerate the exact hop sequence from the shared parameters."""
+                  cycles: int, jitter: float = DEFAULT_JITTER,
+                  period_cycles: int = 1) -> list[Hop]:
+    """Regenerate the exact hop sequence from the shared parameters.
+
+    The pattern repeats every ``period_cycles`` permutations. Periodicity is
+    what makes the receiver cheap: it need only search one period for the
+    epoch, instead of the whole run. A repeated random permutation still
+    autocorrelates sharply, so alignment stays unambiguous; raising
+    ``period_cycles`` trades a longer search for a longer unique sequence.
+    """
     if min_hop_s <= 0:
         raise ValueError("min_hop_s must be positive")
     if cycles < 1:
         raise ValueError("need at least one cycle")
     if not 0.0 <= jitter <= 1.0:
         raise ValueError("jitter must be between 0 and 1")
+    if period_cycles < 1:
+        raise ValueError("period_cycles must be at least 1")
     rng = SplitMix64(seed)
+
+    # One period of (point, dwell), then repeated.
+    period: list[tuple[int, float]] = []
+    for _ in range(period_cycles):
+        for point in _permutation(rng, len(freqs)):
+            period.append((point, min_hop_s * (1.0 + jitter * rng.uniform() * 2.0)))
+
     hops: list[Hop] = []
     t = 0.0
-    seq = 0
-    for cycle in range(cycles):
-        for point in _permutation(rng, len(freqs)):
-            dwell = min_hop_s * (1.0 + jitter * rng.uniform() * 2.0)
-            hops.append(Hop(sequence=seq, cycle=cycle, point=point,
-                            freq_hz=freqs[point], dwell_s=dwell,
-                            start_s=t, end_s=t + dwell))
-            t += dwell
-            seq += 1
+    for seq in range(cycles * len(freqs)):
+        point, dwell = period[seq % len(period)]
+        hops.append(Hop(sequence=seq, cycle=seq // len(freqs), point=point,
+                        freq_hz=freqs[point], dwell_s=dwell,
+                        start_s=t, end_s=t + dwell))
+        t += dwell
     return hops
+
+
+def period_duration(hops: list[Hop], points: int, period_cycles: int = 1) -> float:
+    """Wall time of one repeat of the pattern -- the receiver's search range."""
+    n = points * period_cycles
+    return hops[n].start_s if len(hops) > n else hops[-1].end_s
 
 
 def cycle_duration(hops: list[Hop], cycle: int) -> float:
@@ -174,7 +194,7 @@ def _sleep_until(deadline: float, spin_margin_s: float = 0.002) -> None:
             time.sleep(remaining - spin_margin_s)
 
 
-def run_hops(dev, hops: list[Hop], channel, settle_s: float = 0.0) -> None:
+def run_hops(dev, hops: list[Hop], channel, settle_s: float = 0.05) -> None:
     """Transmit the schedule, hopping continuously with no muted gaps.
 
     Identity comes from the schedule rather than from an on/off pattern, so
@@ -182,12 +202,18 @@ def run_hops(dev, hops: list[Hop], channel, settle_s: float = 0.0) -> None:
     (about 0.84 ms) is the only discontinuity, and it lands inside the dwell it
     precedes rather than eating a coded window.
     """
+    # Cold-start once with autocal so the VCO band is chosen for this span,
+    # then hop without it. Re-running the band search on every hop would blank
+    # the output through mute-till-lock for a large part of each dwell, which
+    # at 5 ms leaves almost nothing radiated.
     dev.set_frequency(hops[0].freq_hz, channel)
+    if settle_s:
+        time.sleep(settle_s)
     dev.set_output(channel, True)
     t0 = time.monotonic()
     for index, hop in enumerate(hops):
         _sleep_until(t0 + hop.end_s)
         nxt = hops[index + 1] if index + 1 < len(hops) else None
         if nxt is not None:
-            dev.set_frequency(nxt.freq_hz, channel)
+            dev.set_frequency(nxt.freq_hz, channel, autocal=False)
     dev.set_output(channel, False)

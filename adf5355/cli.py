@@ -274,6 +274,9 @@ def cmd_hop(args) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    # Mute-till-lock would blank each dwell while the loop re-settles; hops
+    # stay inside one VCO band so there is nothing to re-acquire.
+    args.no_mute_till_lock = True
     config = build_config(args, enable and channel is Channel.A,
                           enable and channel is Channel.B)
     for freq in freqs:                       # validate before transmitting
@@ -302,9 +305,14 @@ def cmd_hop(args) -> int:
 
     dev = open_device(args, config)
     try:
+        # Program the first point BEFORE testing lock: nothing is loaded until
+        # then, so MUXOUT sits at its power-on three-state and any lock check
+        # here would always fail.
+        dev.set_frequency(hops[0].freq_hz, channel)
         if dev.can_detect_lock and not args.no_lock_check:
             try:
-                dev.wait_for_lock(args.lock_timeout)
+                waited = dev.wait_for_lock(args.lock_timeout)
+                print(f"  locked in {waited*1e3:.1f} ms")
             except LockTimeout as exc:
                 print(f"error: {exc}", file=sys.stderr)
                 return 1

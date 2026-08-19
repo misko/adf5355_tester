@@ -60,6 +60,22 @@ class TestSchedule(unittest.TestCase):
         b = make_schedule(0xC0FFEF, self.freqs, 0.005, 5)
         self.assertNotEqual([h.point for h in a], [h.point for h in b])
 
+    def test_the_pattern_repeats_every_period(self):
+        """Periodicity bounds the receiver's epoch search to one period."""
+        hops = make_schedule(0xC0FFEE, self.freqs, 0.005, 6)
+        n = len(self.freqs)
+        first = [h.point for h in hops[:n]]
+        for cycle in range(1, 6):
+            self.assertEqual([h.point for h in hops[cycle*n:(cycle+1)*n]], first)
+
+    def test_a_longer_period_does_not_repeat_early(self):
+        hops = make_schedule(0xC0FFEE, self.freqs, 0.005, 6, period_cycles=3)
+        n = len(self.freqs)
+        self.assertNotEqual([h.point for h in hops[n:2*n]],
+                            [h.point for h in hops[:n]])
+        self.assertEqual([h.point for h in hops[3*n:4*n]],
+                         [h.point for h in hops[:n]])
+
     def test_each_cycle_visits_every_point_exactly_once(self):
         hops = make_schedule(42, self.freqs, 0.005, 8)
         for cycle in range(8):
@@ -71,9 +87,15 @@ class TestSchedule(unittest.TestCase):
         self.assertEqual({round(h.dwell_s, 12) for h in hops}, {0.005})
 
     def test_dwell_law_with_jitter(self):
-        """dwell = min*(1 + jitter*rand*2), so [min, 3*min] at jitter 1."""
+        """dwell = min*(1 + jitter*rand*2), so [min, 3*min] at jitter 1.
+
+        period_cycles is raised so the draws are distinct: the schedule repeats
+        every period, so a single period only ever holds `points` dwells however
+        many cycles are transmitted.
+        """
         minimum = 0.005
-        hops = make_schedule(11, self.freqs, minimum, 30, jitter=1.0)
+        hops = make_schedule(11, self.freqs, minimum, 30, jitter=1.0,
+                             period_cycles=30)
         dwells = [h.dwell_s for h in hops]
         self.assertGreaterEqual(min(dwells), minimum)
         self.assertLess(max(dwells), 3 * minimum)
@@ -109,6 +131,8 @@ class TestSchedule(unittest.TestCase):
             plan_frequencies(11_001_000_000, 11_000_000_000, 5)
         with self.assertRaises(ValueError):
             make_schedule(1, self.freqs, 0.005, 4, jitter=1.5)
+        with self.assertRaises(ValueError):
+            make_schedule(1, self.freqs, 0.005, 4, period_cycles=0)
 
 
 if __name__ == "__main__":

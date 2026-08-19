@@ -236,6 +236,44 @@ per point. Those per-point offsets came back at −105.6 to −106.6 kHz, agreei
 with the −105.9 kHz measured independently by the older ladder method — the
 cross-check that says the number is real and not an artefact of the decoder.
 
+### How long to listen
+
+The transmitted pattern repeats every `points x dwell` — **200 ms** at the
+defaults. That period, not the capture length, is what governs everything.
+Measured against a continuously looping transmitter, varying only
+`SECONDS_LISTEN`:
+
+| listen | periods | points | comb | epoch sigma | point sd | decode |
+|---|---:|---:|---:|---:|---:|---:|
+| 0.1 s | 0.50 | **3/20** | 96x | **5.5** | 10979 Hz | **refused** |
+| 0.2 s | 1.00 | 20/20 | 149x | 20.8 | 64 Hz | 2.4 s |
+| 0.4 s | 2.00 | 20/20 | 138x | 20.9 | 71 Hz | 3.0 s |
+| **2 s** | **10** | **20/20** | **145x** | **19.8** | **56 Hz** | **7.6 s** |
+| 8 s | 40 | 20/20 | 148x | 20.4 | 61 Hz | 22.8 s |
+| 32 s | 160 | 20/20 | 143x | 20.7 | 57 Hz | 85.3 s |
+
+**One period is a hard floor, and everything above it is flat.** At half a
+period only half the points are ever transmitted during the capture, so most are
+unobservable however good the decoder is: it recovered 3 of 20, scored 5.5 sigma
+against a floor of 10, and refused — an answer that would otherwise have been
+**90 kHz wrong** (−16 kHz against a true −106 kHz). That refusal is the point of
+the confidence gate.
+
+From one period upward, nothing improves with more capture. Point-to-point
+spread sits at 56–71 Hz across a 320-fold range of listen time. If it were
+noise-limited it would fall as the square root of time and 32 s would beat
+0.2 s by twelvefold; it does not move at all, so **~60 Hz is a systematic floor**
+— per-slot receiver bias, which no amount of integration touches.
+
+Two things get worse with longer captures. Decode cost scales linearly, about
+2.7x the listen time, so 32 s of signal costs 85 s to decode. And the LNB drifts
+at roughly 4.5 Hz/s, so a long capture averages over a moving target: across the
+runs above the median walked from −105.77 to −106.57 kHz purely with elapsed
+time.
+
+Hence the 2 s default: ten periods, comfortable margin, and the same numbers 32 s
+gives for a twelfth of the decode time.
+
 ### Fixed dwell against jittered
 
 An earlier version of the table above carried a `jitter 5 ms` row whose figures

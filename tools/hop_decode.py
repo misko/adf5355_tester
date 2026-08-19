@@ -75,7 +75,7 @@ DEFAULT_LO_HZ = 9.75e9          # nominal LNB LO: 13 V, no tone = low band
 DEFAULT_LO_ERROR_HZ = 94_000.0  # measured; used only to centre the receiver
 DEFAULT_FS = 2.5e6              # about 2 MHz usable, comfortably over 1.71
 DEFAULT_FRAME = 512             # 204.8 us at 2.5 MS/s: ~49 frames per 10 ms
-DEFAULT_SECONDS = 8.0
+DEFAULT_SECONDS = 2.0     # 10 periods. Measured flat from 1 period to 160.
 DEFAULT_GAIN = 40.0
 DEFAULT_URI = "ip:192.168.2.1"
 DEFAULT_NBUF = 1 << 16

@@ -37,7 +37,9 @@ LO_HZ="${LO_HZ:-9.75e9}"              # NOMINAL LNB LO. 13 V, no 22 kHz tone
                                       # selects low band = 9.75 GHz.
 LO_ERROR_HZ="${LO_ERROR_HZ:-94000}"   # measured LNB LO error, used only to
                                       # centre the receiver on the comb
-SECONDS_LISTEN="${SECONDS_LISTEN:-8}" # 8 s = 40 periods at the defaults
+SECONDS_LISTEN="${SECONDS_LISTEN:-2}" # 2 s = 10 periods. Measured: every
+                                      # metric is flat from 1 period to 160,
+                                      # so longer only costs decode time.
 FS="${FS:-2.5e6}"                     # 2.5 MS/s gives about 2 MHz usable
 FRAME="${FRAME:-512}"                 # must be well under one dwell
 GAIN="${GAIN:-40}"
@@ -113,9 +115,16 @@ if hop_ms / 1e3 / frame_s < 4:
 if frame_s > hop_ms / 1e3:
     print(f"  WARNING: a frame is longer than a dwell; every frame straddles "
           f"hops and nothing will align")
-if secs < 4 * period:
-    print(f"  WARNING: {secs:g} s is under four periods ({4*period:.2f} s); "
-          f"raise SECONDS_LISTEN")
+if secs < period:
+    print(f"  WARNING: {secs:g} s is under ONE period ({period:.2f} s). Only "
+          f"{secs/period*points:.0f} of {points} points are transmitted in that "
+          f"time,\n           so the rest cannot be observed at all. Measured at "
+          f"half a period: 3/20\n           points, 5.5 sigma, and an answer "
+          f"90 kHz wrong -- the decoder refuses it.")
+elif secs < 2 * period:
+    print(f"  NOTE: {secs:g} s is {secs/period:.1f} periods. One period is the "
+          f"hard floor and decodes\n        fine; two or more gives margin if a "
+          f"hop is lost.")
 if fs / frame > span / (points - 1) / 2:
     print(f"  WARNING: bin width {fs/frame/1e3:.1f} kHz is coarse against the "
           f"{span/(points-1)/1e3:.1f} kHz spacing; raise FRAME")

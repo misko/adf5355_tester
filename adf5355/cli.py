@@ -204,8 +204,10 @@ def build_parser() -> argparse.ArgumentParser:
                              f"(default {DEFAULT_REF_MHZ:g}, this board's X1). "
                              f"Clone boards differ -- read the marking rather "
                              f"than assuming")
-    common.add_argument("--ref-doubler", action="store_true")
-    common.add_argument("--ref-div2", action="store_true")
+    common.add_argument("--ref-doubler", action="store_true",
+                        help="double REFIN before the R counter")
+    common.add_argument("--ref-div2", action="store_true",
+                        help="halve the reference after the R counter")
     common.add_argument("--ref-diff", action="store_true",
                         help="differential REFIN input")
     common.add_argument("--r-counter", type=int, default=None,
@@ -220,10 +222,14 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--solver", default="adi", choices=["adi", "exact"])
     common.add_argument("--no-mute-till-lock", action="store_true")
     common.add_argument("--no-negative-bleed", action="store_true")
-    common.add_argument("--bus", type=int, default=0)
+    common.add_argument("--bus", type=int, default=0,
+                        help="SPI bus number (default 0)")
     common.add_argument("--device", type=int, default=0,
                         help="SPI chip select driving LE (0 = CE0)")
-    common.add_argument("--spi-hz", type=int, default=DEFAULT_SPI_HZ)
+    common.add_argument("--spi-hz", type=int, default=DEFAULT_SPI_HZ,
+                        help=f"SPI clock in Hz (default {DEFAULT_SPI_HZ}). "
+                             f"The part accepts up to 50 MHz; lower this if "
+                             f"long jumper wires are marginal")
     common.add_argument("--ce-gpio", type=int, default=DEFAULT_CE_GPIO,
                         help="BCM pin driving CE; -1 if CE is strapped high")
     common.add_argument("--muxout-gpio", type=int, default=DEFAULT_MUXOUT_GPIO,
@@ -231,8 +237,12 @@ def build_parser() -> argparse.ArgumentParser:
                              f"{DEFAULT_MUXOUT_GPIO} = header pin 35); "
                              f"-1 if not wired, which leaves no lock detect "
                              f"and no way to confirm a write landed")
-    common.add_argument("--lock-timeout", type=float, default=0.5)
-    common.add_argument("--no-lock-check", action="store_true")
+    common.add_argument("--lock-timeout", type=float, default=0.5,
+                        help="seconds to wait for digital lock detect before "
+                             "calling a point failed (default 0.5; a healthy "
+                             "lock takes single-digit ms)")
+    common.add_argument("--no-lock-check", action="store_true",
+                        help="skip lock detect entirely and never fail on it")
     common.add_argument("--dry-run", action="store_true",
                         help="compute everything, touch no hardware")
     common.add_argument("--enable-rf", action="store_true",
@@ -259,8 +269,12 @@ def build_parser() -> argparse.ArgumentParser:
                        help="step across a range, checking lock at each point")
     w.add_argument("--start", type=parse_frequency, required=True)
     w.add_argument("--stop", type=parse_frequency, required=True)
-    w.add_argument("--points", type=int, default=51)
-    w.add_argument("--dwell", type=float, default=0.02)
+    w.add_argument("--points", type=int, default=51,
+                   help="number of frequencies to step through, inclusive of "
+                        "both ends (default 51)")
+    w.add_argument("--dwell", type=float, default=0.02,
+                   help="seconds to hold each point after it locks (default "
+                        "0.02). Raise it to follow the sweep on an analyser")
     w.set_defaults(func=cmd_sweep)
 
     o = sub.add_parser("off", parents=[common], help="disable both outputs")

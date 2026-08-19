@@ -61,6 +61,19 @@ the assumed reference, so the VCO lands somewhere else entirely and only the
 points that happen to fall back inside 3.4-6.8 GHz will lock. If you see
 scattered `LOCK FAILED` lines with no frequency pattern, check this first.
 
+### Pacing a sweep
+
+`--dwell` sets how long each point is held after it locks (default `0.02` s);
+`--points` sets the resolution. To follow a sweep on an analyser:
+
+```bash
+python3 -m adf5355 sweep --start 1G --stop 6G --points 51 --dwell 1
+```
+
+`--lock-timeout` (default `0.5` s) is how long to wait before calling a point
+failed -- a healthy lock takes single-digit milliseconds. To park on one
+frequency instead, use `set --hold`.
+
 `--ref-mhz` is required and never guessed: clone boards ship different
 oscillators, and every register depends on it. Read the marking on X1.
 

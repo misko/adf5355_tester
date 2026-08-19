@@ -221,7 +221,6 @@ configuration tried**:
 | fixed 5 ms | 20 | 20/20 | 1361 Hz | −108.252 kHz | 137× |
 | **fixed 10 ms** | **20** | **20/20** | **730 Hz** | **−107.336 kHz** | **422×** |
 | fixed 5 ms | 40 | 40/40 | 1552 Hz | −108.862 kHz | 37× |
-| jitter 5 ms | 40 | 40/40 | 1552 Hz | −108.862 kHz | 73× |
 
 *sd* is the point-to-point spread of the recovered errors. *sharpness* is the
 prototype decoder's **comb** confidence — the peak of the offset search over its
@@ -237,7 +236,30 @@ per point. Those per-point offsets came back at −105.6 to −106.6 kHz, agreei
 with the −105.9 kHz measured independently by the older ladder method — the
 cross-check that says the number is real and not an artefact of the decoder.
 
-Two things fall out of that table:
+### Fixed dwell against jittered
+
+An earlier version of the table above carried a `jitter 5 ms` row whose figures
+were byte-identical to the fixed row beside it — the same sd to the Hertz and
+the same comb offset to three decimals, while disagreeing on sharpness. Two
+captures with different dwell patterns cannot legitimately agree like that, so
+the row was withdrawn and the comparison rerun properly with the shipped
+decoder, 8 s captures at the recommended defaults:
+
+| | comb sharpness | epoch sigma | point-to-point sd | median error |
+|---|---:|---:|---:|---:|
+| **`JITTER=0`** (fixed) | 144× | **20.3** | **57 Hz** | −106.001 kHz |
+| `JITTER=1` | 151× | 14.4 | 60 Hz | −106.331 kHz |
+
+Fixed dwell is not merely no worse, it is **better**, and for a structural
+reason: jitter stretches one period from 200 ms to 376.8 ms, so the epoch search
+covers a longer, less regular pattern and its peak stands less clearly above the
+background — 14.4 sigma against 20.3. Comb sharpness is unaffected, since that
+step never looks at timing.
+
+Nothing is encoded in dwell, so there is nothing to buy by varying it. `--jitter`
+remains available and still decodes 20/20; the default is 0.
+
+Two things fall out of the dwell table:
 
 - **Precision tracks dwell**, because dwell is integration time. 2 → 10 ms
   cuts the spread by 4×. Ten milliseconds is the recommended default.

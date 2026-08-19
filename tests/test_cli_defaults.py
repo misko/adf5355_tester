@@ -54,3 +54,35 @@ class TestReferenceDefault(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRfGate(unittest.TestCase):
+    """--enable-rf must gate every command that builds a register image."""
+
+    def _r6(self, argv):
+        from adf5355 import Channel, plan
+        args = cli.build_parser().parse_args(argv)
+        channel = Channel(args.channel)
+        enable = args.enable_rf
+        cfg = cli.build_config(args, enable and channel is Channel.A,
+                               enable and channel is Channel.B)
+        return plan(cfg, args.freq, channel).registers
+
+    def test_dump_without_enable_rf_disables_both_outputs(self):
+        regs = self._r6(["dump", "--freq", "2.4G"])
+        self.assertEqual(regs.get("rf_out_enable"), 0)
+        self.assertEqual(regs.get("rf_outb_disable"), 1)
+
+    def test_dump_with_enable_rf_enables_channel_a(self):
+        regs = self._r6(["dump", "--freq", "2.4G", "--enable-rf"])
+        self.assertEqual(regs.get("rf_out_enable"), 1)
+
+    def test_dump_with_enable_rf_enables_channel_b_active_low(self):
+        regs = self._r6(["dump", "--freq", "11.7G", "--channel", "B", "--enable-rf"])
+        self.assertEqual(regs.get("rf_outb_disable"), 0)
+        self.assertEqual(regs.get("rf_out_enable"), 0)
+
+    def test_dwell_defaults_to_ten_seconds_and_is_gated(self):
+        args = cli.build_parser().parse_args(["dwell", "--freq", "2.4G"])
+        self.assertEqual(args.dwell, 10.0)
+        self.assertFalse(args.enable_rf)

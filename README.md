@@ -61,6 +61,16 @@ the assumed reference, so the VCO lands somewhere else entirely and only the
 points that happen to fall back inside 3.4-6.8 GHz will lock. If you see
 scattered `LOCK FAILED` lines with no frequency pattern, check this first.
 
+### Transmitting a single tone
+
+```bash
+python3 -m adf5355 dwell --freq 2.4G --dwell 30 --enable-rf
+```
+
+Programs one frequency, confirms lock, transmits for `--dwell` seconds
+(default 10), then mutes and exits. It mutes on Ctrl-C too. Without
+`--enable-rf` there is nothing to dwell on, so it reports and exits at once.
+
 ### Pacing a sweep
 
 `--dwell` sets how long each point is held after it locks (default `0.02` s);

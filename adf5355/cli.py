@@ -2,6 +2,7 @@
 
     python3 -m adf5355 dump  --freq 2.4G
     python3 -m adf5355 set   --freq 11.7G --channel B --enable-rf
+    python3 -m adf5355 dwell --freq 2.4G --dwell 30 --enable-rf
     python3 -m adf5355 sweep --start 1G --stop 6G --points 51
     python3 -m adf5355 off
 
@@ -24,6 +25,10 @@ from .registers import MuxOut, OutputPower
 
 # X1 on this board is marked R125.000.  Overridable, never guessed.
 DEFAULT_REF_MHZ = 125.0
+
+# Ku-band satellite downlink; the ladder script carries the same warning.
+SATBAND_LO_HZ = 10_700_000_000
+SATBAND_HI_HZ = 12_700_000_000
 
 _SUFFIXES = {"k": 1e3, "m": 1e6, "g": 1e9}
 
@@ -87,9 +92,18 @@ def report_lock(dev: ADF5355, args) -> bool:
 
 def cmd_dump(args) -> int:
     channel = Channel(args.channel)
-    config = build_config(args, channel is Channel.A, channel is Channel.B)
+    # Mirror the RF gate exactly: dump exists to preview the bytes that would
+    # actually be written, so showing an output enabled when it would not be
+    # defeats the point.
+    enable = args.enable_rf
+    config = build_config(args, enable and channel is Channel.A,
+                          enable and channel is Channel.B)
     p = plan(config, args.freq, channel)
     print(p.summary())
+    if not enable:
+        print(f"  outputs DISABLED in this image "
+              f"(rf_out_enable=0, rf_outb_disable=1); add --enable-rf to see "
+              f"the transmitting image")
     print()
     print(p.registers.dump())
     print()
@@ -125,6 +139,42 @@ def cmd_set(args) -> int:
     finally:
         if args.hold or not args.enable_rf:
             dev.close()
+    return 0
+
+
+def cmd_dwell(args) -> int:
+    """Hold one frequency for a fixed time, then mute and exit."""
+    channel = Channel(args.channel)
+    enable = args.enable_rf
+    config = build_config(args, enable and channel is Channel.A,
+                          enable and channel is Channel.B)
+    p = plan(config, args.freq, channel)
+    print(p.summary())
+
+    if SATBAND_LO_HZ <= args.freq <= SATBAND_HI_HZ:
+        print("\nSAFETY: this frequency is inside the 10.7-12.7 GHz satellite "
+              "downlink band. Use a shielded, attenuated path; do not radiate.")
+
+    dev = open_device(args, config)
+    try:
+        dev.program(p)
+        if not report_lock(dev, args):
+            print("not transmitting: never locked", file=sys.stderr)
+            return 1
+
+        achieved = float(p.solution.achieved_hz) / 1e9
+        if not enable:
+            print(f"\nprogrammed RFout{channel.value} {achieved:.9f} GHz but RF "
+                  f"is disabled, so there is nothing to dwell on.\n"
+                  f"Re-run with --enable-rf into a shielded/attenuated path.")
+            return 0
+
+        print(f"\ntransmitting RFout{channel.value} {achieved:.9f} GHz "
+              f"for {args.dwell:g} s (Ctrl-C to stop early)")
+        time.sleep(args.dwell)
+    finally:
+        dev.close()          # close() mutes both outputs on the way out
+    print("dwell complete; output muted")
     return 0
 
 
@@ -265,6 +315,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="seconds to hold the output before muting")
     s.set_defaults(func=cmd_set)
 
+    dw = sub.add_parser("dwell", parents=[common],
+                        help="transmit one frequency for a fixed time, then "
+                             "mute and exit")
+    dw.add_argument("--freq", type=parse_frequency, required=True)
+    dw.add_argument("--dwell", type=float, default=10.0,
+                    help="seconds to transmit before muting and exiting "
+                         "(default 10)")
+    dw.set_defaults(func=cmd_dwell)
+
     w = sub.add_parser("sweep", parents=[common],
                        help="step across a range, checking lock at each point")
     w.add_argument("--start", type=parse_frequency, required=True)
@@ -283,6 +342,30 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _shutdown_gpio() -> None:
+    """Tear down gpiozero's pin factory before the interpreter finalizes.
+
+    The lgpio factory keeps a daemon thread alive.  If the interpreter starts
+    finalizing while it is still running, CPython intermittently aborts with
+    "could not acquire lock for <_io.BufferedWriter name='<stderr>'> at
+    interpreter shutdown", and the process exits 134 even though the command
+    already succeeded -- which silently breaks anything checking exit status.
+    Closing the factory here retires that thread while the runtime is healthy.
+
+    Looked up through sys.modules so a --dry-run never imports gpiozero.
+    """
+    module = sys.modules.get("gpiozero")
+    if module is None:
+        return
+    try:
+        factory = module.Device.pin_factory
+        if factory is not None:
+            factory.close()
+            module.Device.pin_factory = None
+    except Exception:
+        pass
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -298,6 +381,8 @@ def main(argv=None) -> int:
     except (ValueError, LockTimeout) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    finally:
+        _shutdown_gpio()
 
 
 if __name__ == "__main__":

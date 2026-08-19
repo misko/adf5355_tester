@@ -107,3 +107,51 @@ class TestPowerDefault(unittest.TestCase):
         cfg = cli.build_config(args, True, False)
         regs = plan(cfg, args.freq, Channel.A).registers
         self.assertEqual(regs.get("output_power"), 3)
+
+
+class TestThreadExceptHook(unittest.TestCase):
+    """Only lgpio's benign teardown error may be swallowed."""
+
+    def setUp(self):
+        import importlib
+        self.mod = importlib.import_module("adf5355.__main__") \
+            if "adf5355.__main__" in sys.modules else None
+
+    def _hook_module(self):
+        # Import the entry point's helpers without executing main().
+        import types, pathlib
+        src = pathlib.Path(context.ROOT, "adf5355", "__main__.py").read_text()
+        src = src.split("threading.excepthook = _thread_excepthook")[0]
+        ns = types.ModuleType("entry_helpers")
+        exec(compile(src, "__main__.py", "exec"), ns.__dict__)
+        return ns
+
+    def _args(self, exc_type, exc_value):
+        class A:
+            pass
+        a = A(); a.exc_type = exc_type; a.exc_value = exc_value
+        a.exc_traceback = None; a.thread = None
+        return a
+
+    def test_system_exit_is_ignored(self):
+        ns = self._hook_module()
+        self.assertTrue(ns._is_lgpio_teardown_noise(self._args(SystemExit, SystemExit())))
+
+    def test_real_errors_are_not_ignored(self):
+        ns = self._hook_module()
+        for exc in (ValueError("boom"), RuntimeError("bad"), OSError("io")):
+            self.assertFalse(
+                ns._is_lgpio_teardown_noise(self._args(type(exc), exc)),
+                f"{type(exc).__name__} must still be reported")
+
+    def test_unrelated_lgpio_errors_are_not_ignored(self):
+        ns = self._hook_module()
+
+        class FakeLgpioError(Exception):
+            pass
+        FakeLgpioError.__module__ = "lgpio"
+        FakeLgpioError.__name__ = "error"
+        self.assertFalse(ns._is_lgpio_teardown_noise(
+            self._args(FakeLgpioError, FakeLgpioError("GPIO busy"))))
+        self.assertTrue(ns._is_lgpio_teardown_noise(
+            self._args(FakeLgpioError, FakeLgpioError("unknown handle"))))

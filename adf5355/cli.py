@@ -24,8 +24,9 @@ from .ladder import (make_ladder, format_ladder, run_ladder,
                      overlaps_satellite_band, check_schedule_feasible,
                      DEFAULT_START_HZ, DEFAULT_STOP_HZ, DEFAULT_STEPS,
                      DEFAULT_TOTAL_S)
-from .hopper import (DEFAULT_JITTER, DEFAULT_MIN_HOP_S, DEFAULT_POINTS,
-                     DEFAULT_SEED,
+from .hopper import (DEFAULT_CYCLES, DEFAULT_HOP_START_HZ,
+                     DEFAULT_HOP_STOP_HZ, DEFAULT_JITTER, DEFAULT_MIN_HOP_S,
+                     DEFAULT_PERIOD_CYCLES, DEFAULT_POINTS, DEFAULT_SEED,
                      describe as describe_hops, make_schedule,
                      plan_frequencies, run_hops)
 from .plan import Channel, SynthConfig, plan
@@ -269,7 +270,7 @@ def cmd_hop(args) -> int:
         freqs = plan_frequencies(round(args.start_ghz * 1e9),
                                  round(args.stop_ghz * 1e9), args.points)
         hops = make_schedule(args.seed, freqs, args.min_hop_ms / 1e3,
-                             args.cycles, args.jitter)
+                             args.cycles, args.jitter, args.period_cycles)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -290,7 +291,8 @@ def cmd_hop(args) -> int:
                         args.jitter))
     print(f"\n  the receiver needs only: seed 0x{args.seed:X}, "
           f"{args.start_ghz}-{args.stop_ghz} GHz, {args.points} points, "
-          f"hop {args.min_hop_ms:g} ms, jitter {args.jitter:g}")
+          f"hop {args.min_hop_ms:g} ms, jitter {args.jitter:g}, "
+          f"period-cycles {args.period_cycles}")
     lo, hi = freqs[0], freqs[-1]
     if lo <= SATBAND_HI_HZ and hi >= SATBAND_LO_HZ:
         print("\nSAFETY: overlaps the 10.7-12.7 GHz satellite downlink band. "
@@ -482,24 +484,34 @@ def build_parser() -> argparse.ArgumentParser:
     hop.add_argument("--seed", type=lambda v: int(v, 0), default=DEFAULT_SEED,
                      help=f"shared schedule seed (default 0x{DEFAULT_SEED:X}); "
                           f"accepts 0x notation")
-    hop.add_argument("--start-ghz", type=float, default=11.0,
-                     help="first frequency point in GHz")
-    hop.add_argument("--stop-ghz", type=float, default=11.00171,
-                     help="last frequency point in GHz; the whole span should "
-                          "fit the receiver's instantaneous bandwidth")
+    hop.add_argument("--start-ghz", type=float,
+                     default=DEFAULT_HOP_START_HZ / 1e9,
+                     help=f"first frequency point in GHz (default "
+                          f"{DEFAULT_HOP_START_HZ / 1e9:g})")
+    hop.add_argument("--stop-ghz", type=float,
+                     default=DEFAULT_HOP_STOP_HZ / 1e9,
+                     help=f"last frequency point in GHz (default "
+                          f"{DEFAULT_HOP_STOP_HZ / 1e9:g}); the whole span "
+                          f"should fit the receiver's instantaneous bandwidth")
     hop.add_argument("--points", type=int, default=DEFAULT_POINTS,
                      help=f"number of frequency points (default {DEFAULT_POINTS})")
     hop.add_argument("--min-hop-ms", type=float,
                      default=DEFAULT_MIN_HOP_S * 1e3,
-                     help=f"minimum dwell in ms (default "
-                          f"{DEFAULT_MIN_HOP_S*1e3:g}); each dwell is "
-                          f"min + rand(0,1)*min*2")
+                     help=f"dwell in ms (default "
+                          f"{DEFAULT_MIN_HOP_S*1e3:g}); fixed unless "
+                          f"--jitter, which makes it min*(1 + jitter*rand*2)")
     hop.add_argument("--jitter", type=float, default=DEFAULT_JITTER,
                      help=f"dwell randomness 0..1 (default {DEFAULT_JITTER:g} = "
                           f"fixed). dwell = min*(1 + jitter*rand*2); identity "
                           f"comes from the frequency order, not from timing")
-    hop.add_argument("--cycles", type=int, default=100,
-                     help="permutations to transmit (default 100)")
+    hop.add_argument("--period-cycles", type=int,
+                     default=DEFAULT_PERIOD_CYCLES,
+                     help=f"permutations before the pattern repeats (default "
+                          f"{DEFAULT_PERIOD_CYCLES}); the receiver searches "
+                          f"one period for the epoch, so both ends must agree")
+    hop.add_argument("--cycles", type=int, default=DEFAULT_CYCLES,
+                     help=f"permutations to transmit (default "
+                          f"{DEFAULT_CYCLES})")
     hop.set_defaults(func=cmd_hop, channel_default="B")
 
     lad = sub.add_parser("ladder", parents=[common],

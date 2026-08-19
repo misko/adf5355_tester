@@ -5,20 +5,24 @@ Control an ADF5355 wideband synthesizer (54 MHz – 13.6 GHz) from a Raspberry P
 > ## ⚠️ Closed RF paths only — never radiate
 >
 > Everything in this repository is a **bench procedure into a closed, shielded,
-> attenuated path**. The ladder and the calibration described below are
+> attenuated path**. The hop, the ladder and the calibration described below are
 > theoretical exercises for conducted test setups only.
 >
 > **Never connect an antenna. Never transmit any of this over the air.**
 >
-> The default ladder occupies 10.7–12.7 GHz, which is *satellite downlink*
-> spectrum. Terrestrial transmission there is prohibited in essentially every
+> The default hop sits at 11.0 GHz and the default ladder occupies
+> 10.7–12.7 GHz, both *satellite downlink* spectrum. Terrestrial transmission there is prohibited in essentially every
 > jurisdiction, and even a few milliwatts near a dish or LNB can wipe out
 > reception well beyond your own bench. Keep the synthesiser output conducted:
 > coax into a load, an attenuator, or a shielded enclosure.
 
 Provides a single `adf5355` command for bring-up, register inspection, single-tone
-transmission, band sweeps with lock verification, and a duration-coded frequency
-ladder that a downstream receiver can use to measure its own clock error.
+transmission, band sweeps with lock verification, and a **seeded pseudorandom
+frequency hop** that a downstream receiver can use to measure its own clock
+error — together with `tools/hop_decode.py`, the receive end that decodes it.
+
+The hop is the recommended method and is the one that works on the bench; the
+older duration-coded ladder is kept, and documented, but superseded.
 
 ---
 
@@ -127,7 +131,8 @@ adf5355 probe                                   # is the chip receiving writes?
 adf5355 dump   --freq 2.4G                      # registers, no hardware touched
 adf5355 set    --freq 2.4G --enable-rf --hold 5
 adf5355 dwell  --freq 2.4G --dwell 30 --enable-rf
-adf5355 ladder --enable-rf                      # duration-coded Ku-band pattern
+adf5355 hop    --enable-rf                      # seeded pseudorandom hop
+adf5355 ladder --enable-rf                      # duration-coded (superseded)
 adf5355 sweep  --start 1G --stop 6G --points 51
 adf5355 off
 ```
@@ -138,7 +143,8 @@ adf5355 off
 | `dump` | Solves a frequency and prints the full register image with every field named, plus the write order. Touches no hardware. |
 | `set` | Programs one frequency, optionally holding it with `--hold`. |
 | `dwell` | Transmits one frequency for `--dwell` seconds, then mutes and exits. |
-| `ladder` | Duration-coded ladder — see below. |
+| `hop` | Seeded pseudorandom frequency hop — the recommended calibration pattern, see below. |
+| `ladder` | Duration-coded ladder — superseded by `hop`, see below. |
 | `sweep` | Steps a range and checks lock at every point. Exits non-zero if any point fails. |
 | `off` | Disables both outputs. |
 
@@ -182,7 +188,196 @@ failed; a healthy lock takes single-digit milliseconds.
 
 ---
 
-## The duration-coded ladder
+## Seeded frequency hopping (recommended)
+
+**This is what works on the bench, and it is what the two runner scripts drive.**
+The synthesiser hops among a set of frequencies in an order derived entirely
+from a shared seed. The receiver knows the seed, so it regenerates the identical
+schedule and never has to work out *which* point it is hearing — only *when* the
+pattern started, which is a single one-dimensional search. Nothing is encoded in
+burst length, and no control channel between the two ends is needed.
+
+```bash
+./adf5355_rf_hop.sh      # transmit; leave it running
+./sdr_listen.sh          # listen once, decode, report per-point error
+```
+
+That is the whole procedure. Both scripts print the schedule they are working
+from before they do anything, so a mismatch between the two ends is visible
+rather than silent — and the settings blocks at the top of each are checked
+against each other by the test suite, because that drift is the failure this
+design exists to prevent.
+
+### Measured: hopping decodes, duration coding does not
+
+Both methods were run over the same chain (ADF5355 → LNB → PlutoSDR at
+2.5 MS/s, 8 s captures). The duration-coded ladder **never identified more than
+1 burst in 95**. Seeded hopping identified **100% of points in every
+configuration tried**:
+
+| dwell | points | identified | sd | recovered comb offset | sharpness |
+|---|---:|---:|---:|---:|---:|
+| fixed 2 ms | 20 | 20/20 | 2946 Hz | −110.693 kHz | 38× |
+| fixed 5 ms | 20 | 20/20 | 1361 Hz | −108.252 kHz | 137× |
+| **fixed 10 ms** | **20** | **20/20** | **730 Hz** | **−107.336 kHz** | **422×** |
+| fixed 5 ms | 40 | 40/40 | 1552 Hz | −108.862 kHz | 37× |
+| jitter 5 ms | 40 | 40/40 | 1552 Hz | −108.862 kHz | 73× |
+
+*sd* is the point-to-point spread of the recovered errors; *sharpness* is the
+confidence figure the prototype decoder printed (how far the winning search
+position stood above the rest of the search). `tools/hop_decode.py` now reports
+two figures separately — comb sharpness and epoch sigma — and measures the epoch
+statistic against the *background* of the search rather than all of it, so a
+rerun prints a much larger sigma than the column above. Comb sharpness is
+comparable.
+
+Two things fall out of that table:
+
+- **Precision tracks dwell**, because dwell is integration time. 2 → 10 ms
+  cuts the spread by 4×. Ten milliseconds is the recommended default.
+- **Jitter buys nothing measurable.** Fixed dwell is therefore preferred: it is
+  simpler, and it makes epoch alignment a uniform grid search.
+
+Recovered offsets of −105.6 to −106.6 kHz agree with the −105.9 kHz measured
+independently by the older ladder method, which is the cross-check that says
+the number is real and not an artefact of the decoder.
+
+### Why it beats duration coding
+
+- **Identity comes from the seed, not from a measured duration.** Estimating a
+  burst length was the fragile step: it needs hysteresis, gap merging and
+  tolerance, and it collapses outright when adjacent points share the capture
+  band — which, for a span narrow enough to hear at one tuning, they always do.
+- **Random order decorrelates frequency from time.** A monotonic ladder steps
+  frequency in lockstep with time, so oscillator drift lands squarely on the
+  frequency-dependent term being measured. Randomising the order makes drift
+  orthogonal to it rather than confounded with it.
+- **A pseudorandom pattern autocorrelates sharply**, so the epoch search has one
+  unmistakable winner. A monotonic ramp correlates broadly and aligns poorly.
+- **It is far faster.** A cycle is 200 ms at the recommended 10 ms dwell (100 ms
+  at 5 ms) against 4.2 s for the equivalent ladder, and none of it is spent
+  muted. An 8 s capture holds 40 complete cycles instead of not quite two.
+
+### Recommended defaults
+
+| Setting | Value | Why |
+|---|---|---|
+| dwell | fixed 10 ms | best measured precision, 730 Hz sd |
+| points | 20 | 20/20 recovered; 40 also works |
+| span | 11.000000 → 11.001710 GHz | 1.71 MHz, 90 kHz spacing |
+| seed | `0xC0FFEE` | the entire agreement between the two ends |
+| cycles | 300 | 60 s of transmit, so the receiver can be started after it |
+| receiver | 2.5 MS/s, 512-sample frames | ~2 MHz usable, 49 frames per dwell |
+| capture | 8 s | 40 cycles |
+
+The span must fit the receiver's instantaneous bandwidth so that one tuning
+hears every point. `sdr_listen.sh` tunes to (midpoint of span) − LO_nominal −
+LO_error_estimate; with a 9.75 GHz LNB and its measured ≈94 kHz LO error that
+puts the comb at about 1250.8 MHz, where the total offset seen is about
+−106 kHz.
+
+Override either end from the environment — but override **both**:
+
+```bash
+POINTS=40 HOP_MS=5 ./adf5355_rf_hop.sh
+POINTS=40 HOP_MS=5 SECONDS_LISTEN=20 ./sdr_listen.sh
+```
+
+### How the decoder works
+
+`tools/hop_decode.py` captures from the Pluto (or reads a capture off disk) and
+runs five steps:
+
+1. **Frame** the capture into blocks well shorter than one dwell, subtract each
+   frame's mean to kill the receiver's DC spur, window, and FFT.
+2. **Find the comb.** Every point shares one unknown offset — the LNB's LO error
+   plus the receiver's clock error are common to all of them — so the comb moves
+   as one rigid object. Slide it over the time-averaged spectrum and keep the
+   offset with the most energy in the expected bins.
+3. **Build a per-point envelope**: for each point, the largest magnitude inside a
+   narrow slot around its offset-corrected expected frequency, per frame. This
+   is the step that makes the whole thing work. A single broadband envelope
+   merges adjacent points into one continuous excursion and tells you nothing.
+4. **Align the epoch.** Regenerate the schedule from the seed and slide it over
+   **one period only** — the pattern repeats every `--period-cycles`
+   permutations — scoring each shift by the mean envelope of the point the
+   schedule expects in each frame. That bounds the search at 200 ms instead of
+   the length of the run.
+5. **Measure.** Per point, the median interpolated peak frequency over the frames
+   the schedule assigns to it, keeping only frames that stand clear of that
+   point's own noise floor. The frequency error is measured minus nominal IF.
+
+The schedule itself is imported from `adf5355.hopper` — the same generator the
+transmitter runs — so the two ends cannot drift apart.
+
+### Reading the confidence figures
+
+A confident wrong answer is the failure that matters, so every run prints two
+numbers and shouts if either is poor:
+
+```
+  comb offset  : -106.421 kHz (sharpness 9867x, floor 8x)
+  epoch        : 37.17 ms of a 200.0 ms period (sigma 1104.8, floor 10)
+  points       : 20/20 recovered from 4882 frames (1.00 s, slot +/-27.0 kHz)
+```
+
+- **comb sharpness** — peak over median of the offset search. Under 8× means the
+  comb was not found and the offset is not a measurement. Pure noise scores
+  under 2×; the bench runs scored 37–422×.
+- **epoch sigma** — how far the winning alignment stands above the background of
+  the search. Under 10 means the alignment is ambiguous and *every point may be
+  mislabelled*. Decoding with the wrong seed scores under 5.
+- **points recovered** — anything short of all of them says the span does not fit
+  the passband, or the two ends disagree about the schedule.
+
+When any of those is poor the report prints a `CONFIDENCE IS POOR` banner and
+the tool exits non-zero, so a scripted run fails rather than quietly recording a
+number.
+
+### Verifying it with no hardware at all
+
+```bash
+python3 tools/hop_decode.py --self-test
+```
+
+synthesises the capture a perfect receiver would have taken — the real schedule,
+a planted comb offset and a planted epoch — and decodes it, so the whole chain
+can be exercised on a machine with no radio and nothing transmitting. The test
+suite does the same thing and asserts the planted numbers come back.
+
+A capture can also be kept and re-analysed later, which is the cheapest way to
+try decoder settings against real data:
+
+```bash
+./sdr_listen.sh --capture-out run.iq          # capture and decode
+python3 tools/hop_decode.py --capture run.iq --frame 1024 --json
+```
+
+### What a narrow hop cannot do
+
+The receiver's clock error is the *slope* of Δf against frequency, so separating
+it from the LNB's LO error needs frequency span. Across 1.71 MHz a 9 ppm clock
+error moves Δf by about 15 Hz, far under the receiver's tuning-dependent
+systematic. One hop run therefore measures the total offset at one frequency
+very precisely, but cannot split it into its two causes. To get both, run the
+same hop at several widely separated centres — say 10.7, 11.1 and 11.5 GHz —
+and fit the precise local offsets against frequency; the spread across centres
+restores the lever arm. See
+[Using the ladder to measure a receiver's clock offset](#using-the-ladder-to-measure-a-receivers-clock-offset)
+for the algebra, which is unchanged.
+
+---
+
+## The duration-coded ladder (superseded)
+
+> **Superseded by [seeded frequency hopping](#seeded-frequency-hopping-recommended).**
+> On the bench the ladder never identified more than 1 burst in 95, because
+> identity depends on *measuring* a burst length and adjacent rungs inside one
+> capture band merge into a single continuous excursion. Hopping identified
+> 100% of points in every configuration tried. The ladder is kept because it is
+> the pattern in the original guide, because its wide-span form is still the way
+> to separate a receiver's clock error from the LNB's LO error, and because its
+> independent measurement of −105.9 kHz is what cross-checks the hop decoder.
 
 ```bash
 adf5355 ladder --enable-rf                            # the guide's pattern
@@ -240,25 +435,15 @@ true to the schedule.
 
 ### Ready-made scripts
 
-Two scripts drive both ends of a calibration. Run them in separate shells, the
-transmitter first:
+The two runner scripts — `adf5355_rf_hop.sh` and `sdr_listen.sh` — drive the
+**hop**, not the ladder; see
+[Seeded frequency hopping](#seeded-frequency-hopping-recommended).
+There is no runner script for the ladder any more. Run it straight from the CLI:
 
 ```bash
-./adf5355_rf_ladder.sh      # transmit the ladder
-./sdr_listen.sh             # listen once and decode it
+adf5355 ladder --start-ghz 11.0 --stop-ghz 11.00171 \
+               --steps 20 --total-s 4.2 --loops 6 --enable-rf
 ```
-
-Both take the same ladder definition and both print it before starting, so a
-mismatch is visible rather than silent. Override from the environment:
-
-```bash
-STEPS=24 TOTAL_S=6.0 ./adf5355_rf_ladder.sh
-STEPS=24 TOTAL_S=6.0 SECONDS_LISTEN=40 ./sdr_listen.sh
-```
-
-`sdr_listen.sh` works out its own tuning from the ladder range and the LNB LO,
-and warns if the listen is shorter than one full cycle, if the span will not fit
-the sample rate, or if the shortest burst spans too few frames.
 
 ### Fast, narrow ladders: the whole cycle in one capture
 
@@ -512,11 +697,14 @@ attached.
 |---|---|
 | `adf5355/registers.py` | Bit positions — the single source of truth |
 | `adf5355/plan.py` | Frequency → field values (solver + register assembly) |
-| `adf5355/ladder.py` | Duration-coded ladder pattern and runner |
+| `adf5355/hopper.py` | Seeded hop schedule (SplitMix64) and runner — the contract between the two ends |
+| `adf5355/ladder.py` | Duration-coded ladder pattern and runner (superseded) |
 | `adf5355/device.py` | spidev + GPIO, write ordering, autocal, lock detect |
 | `adf5355/cli.py` | Command line front end |
 | `adf5355/entry.py` | Process entry point and shutdown handling |
 | `adf5355_ladder.py` | Original standalone bench script, kept as a reference |
+| `tools/hop_decode.py` | Receive end: capture, find the comb, align the epoch, measure |
+| `adf5355_rf_hop.sh` / `sdr_listen.sh` | The two ends of a hop calibration, one command each |
 
 ### Frequency solving
 
@@ -540,7 +728,9 @@ the residual is real rather than a float artifact.
 python3 -m unittest discover -s tests -t .
 ```
 
-90 tests, no hardware required. The register images are checked three ways:
+161 tests, no hardware required — including the hop decoder, which is exercised
+against synthetic captures carrying a planted comb offset and a planted epoch.
+The register images are checked three ways:
 
 1. **`tests/test_registers.py`** — the bitfield table itself: no field overlaps
    another, collides with reserved bits, or corrupts the address nibble.
@@ -552,6 +742,19 @@ python3 -m unittest discover -s tests -t .
    the package must reproduce `adf5355_ladder.py`'s register images and ladder
    schedules exactly. That script has been used on the bench, so it counts as a
    third independent implementation.
+
+Two more guard the calibration rather than the registers:
+
+4. **`tests/test_hop_decode.py`** — synthesises the capture a perfect receiver
+   would have taken, then asserts the decoder recovers the planted offset to
+   within a fraction of a bin, the planted epoch to within a frame, and every
+   point; and that a wrong seed or pure noise is reported as untrustworthy
+   rather than measured.
+5. **`tests/test_script_defaults.py`** — parses `adf5355_rf_hop.sh` and
+   `sdr_listen.sh` and asserts every shared setting matches, that each is
+   actually passed through to the tool it drives, and that both agree with the
+   package defaults. Drift between the two ends is the failure the whole design
+   guards against, so it is checked mechanically rather than by eye.
 
 ### Known defects in the Analog Devices reference
 
@@ -581,8 +784,8 @@ bugs. Each is corrected here and marked `DIVERGENCE` in `plan.py`.
 
 **These are theoretical bench tests and must never be performed over open air.**
 
-The default ladder sweeps 10.7–12.7 GHz, which overlaps satellite downlink
-allocations. Transmitting there terrestrially is prohibited in essentially every
+The default hop sits at 11.0 GHz and the default ladder sweeps 10.7–12.7 GHz,
+both of which overlap satellite downlink allocations. Transmitting there terrestrially is prohibited in essentially every
 jurisdiction, requires a licence you almost certainly do not hold, and can
 interfere with satellite reception far outside your own site.
 

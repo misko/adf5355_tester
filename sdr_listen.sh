@@ -1,45 +1,67 @@
 #!/usr/bin/env bash
 #
-# RECEIVE side of a frequency-ladder calibration.
+# RECEIVE side of a seeded frequency-hop calibration.
 #
-# Listens ONCE at a fixed tuning for long enough to hear at least one complete
-# ladder cycle, then decodes it: each burst is identified purely by its
-# duration against the published schedule, mapped back to that rung's
-# frequency, and its frequency error recorded. The transmitter is never
-# controlled or queried from here -- only observed.
+# Listens ONCE at a fixed tuning -- the whole hop span sits inside the
+# receiver's instantaneous bandwidth, so one tuning hears every point -- then
+# regenerates the transmitter's schedule from the shared seed, aligns it to the
+# capture, and reports each point's frequency error.
 #
-# Start adf5355_rf_ladder.sh first, then run this. Keep the ladder settings
-# below identical to that script's, since they are the "published parameters"
-# the decoder works from.
+# Nothing is inferred from what the capture looks like: identity comes from the
+# seed, so the only unknown is where the pattern started. The decoder prints a
+# comb sharpness and an epoch sigma with every run, and shouts if either is
+# poor, because a confident wrong answer is the failure that matters.
+#
+# Start adf5355_rf_hop.sh first, then run this. The schedule block below must
+# be IDENTICAL to that script's -- those numbers are the entire protocol
+# between the two ends.
 #
 # Override from the environment, e.g.
-#     SECONDS_LISTEN=40 FS=3e6 ./sdr_listen.sh
+#     SECONDS_LISTEN=20 FS=3e6 ./sdr_listen.sh
+#
+# Anything after -- is passed to the decoder, e.g.
+#     ./sdr_listen.sh --capture-out run.iq --json
 #
 set -euo pipefail
 
-# ---- ladder definition (must match adf5355_rf_ladder.sh) ------------------
-START_GHZ="${START_GHZ:-11.0}"
-STOP_GHZ="${STOP_GHZ:-11.00171}"
-STEPS="${STEPS:-20}"
-TOTAL_S="${TOTAL_S:-4.2}"
+# ---- schedule: EVERY LINE HERE MUST MATCH adf5355_rf_hop.sh ---------------
+SEED="${SEED:-0xC0FFEE}"              # the whole protocol between the two ends
+START_GHZ="${START_GHZ:-11.0}"        # first frequency point
+STOP_GHZ="${STOP_GHZ:-11.00171}"      # last; span must fit the receiver
+POINTS="${POINTS:-20}"                # frequency points, 90 kHz apart
+HOP_MS="${HOP_MS:-10}"                # dwell per hop; precision tracks this
+JITTER="${JITTER:-0}"                 # 0 = fixed dwell (measured no worse)
+PERIOD_CYCLES="${PERIOD_CYCLES:-1}"   # permutations before the pattern repeats
 # ---- receive chain --------------------------------------------------------
 LO_HZ="${LO_HZ:-9.75e9}"              # NOMINAL LNB LO. 13 V, no 22 kHz tone
                                       # selects low band = 9.75 GHz.
 LO_ERROR_HZ="${LO_ERROR_HZ:-94000}"   # measured LNB LO error, used only to
                                       # centre the receiver on the comb
-SECONDS_LISTEN="${SECONDS_LISTEN:-20}"
+SECONDS_LISTEN="${SECONDS_LISTEN:-8}" # 8 s = 40 periods at the defaults
 FS="${FS:-2.5e6}"                     # 2.5 MS/s gives about 2 MHz usable
-FRAME="${FRAME:-2048}"                # must be well under the shortest burst
+FRAME="${FRAME:-512}"                 # must be well under one dwell
 GAIN="${GAIN:-40}"
 URI="${URI:-ip:192.168.2.1}"
+# ---------------------------------------------------------------------------
 
-UTILS="${UTILS:-$HOME/pluto-plus-utils}"
-LISTENER="${LISTENER:-$HOME/adf5355_tester/tools/freq_ladder_listen.py}"
-[ -f "$LISTENER" ] || { echo "error: listener not found at $LISTENER" >&2; exit 1; }
-[ -d "$UTILS" ]    || { echo "error: pluto-plus-utils not found at $UTILS" >&2; exit 1; }
+REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+DECODER="${DECODER:-$REPO/tools/hop_decode.py}"
+UTILS="${UTILS:-$HOME/pluto-plus-utils}"   # only for its pyadi-iio + numpy
+[ -f "$DECODER" ] || { echo "error: decoder not found at $DECODER" >&2; exit 1; }
 
-# Centre on the middle of the comb, shifted by the known LNB LO error so the
-# whole span stays inside the passband.
+# The decoder needs numpy, and needs pyadi-iio only when it opens the radio.
+if [ -n "${PYTHON_RUN:-}" ]; then
+    read -r -a RUNNER <<< "$PYTHON_RUN"
+elif [ -d "$UTILS" ]; then
+    RUNNER=(uv run --project "$UTILS" python)
+else
+    RUNNER=(python3)
+fi
+
+# Centre on the middle of the span, shifted by the known LNB LO error so the
+# whole comb stays inside the passband. The decoder derives the same number;
+# computing it here as well is what makes the tuning visible before anything
+# is captured.
 IF_HZ="$(python3 - "$START_GHZ" "$STOP_GHZ" "$LO_HZ" "$LO_ERROR_HZ" <<'PY'
 import sys
 start, stop, lo, err = (float(sys.argv[1])*1e9, float(sys.argv[2])*1e9,
@@ -48,42 +70,71 @@ print(int(round((start + stop) / 2 - lo - err)))
 PY
 )"
 
-python3 - "$START_GHZ" "$STOP_GHZ" "$STEPS" "$TOTAL_S" "$FS" "$FRAME" \
-          "$SECONDS_LISTEN" "$IF_HZ" <<'PY'
-import sys
-start, stop, steps, total, fs, frame, secs, if_hz = (
-    float(sys.argv[1]), float(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4]),
-    float(sys.argv[5]), int(sys.argv[6]), float(sys.argv[7]), float(sys.argv[8]))
-u = total / (steps * (steps + 1))
-span = (stop - start) * 1e9
+REPO="$REPO" python3 - "$SEED" "$START_GHZ" "$STOP_GHZ" "$POINTS" "$HOP_MS" \
+        "$JITTER" "$PERIOD_CYCLES" "$FS" "$FRAME" "$SECONDS_LISTEN" "$IF_HZ" <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["REPO"])
+from adf5355.hopper import make_schedule, period_duration, plan_frequencies
+
+seed = int(sys.argv[1], 0)
+start, stop = float(sys.argv[2]) * 1e9, float(sys.argv[3]) * 1e9
+points, hop_ms, jitter = int(sys.argv[4]), float(sys.argv[5]), float(sys.argv[6])
+period_cycles, fs, frame = int(sys.argv[7]), float(sys.argv[8]), int(sys.argv[9])
+secs, if_hz = float(sys.argv[10]), float(sys.argv[11])
+
+freqs = plan_frequencies(round(start), round(stop), points)
+hops = make_schedule(seed, freqs, hop_ms / 1e3, period_cycles + 1, jitter,
+                     period_cycles)
+period = period_duration(hops, points, period_cycles)
+span = stop - start
+frame_s = frame / fs
+
+print(f"  schedule     : seed 0x{seed:X}, {points} points "
+      f"{start/1e9:.6f}-{stop/1e9:.6f} GHz "
+      f"(spacing {span/(points-1)/1e3:.1f} kHz, span {span/1e6:.3f} MHz)")
+print(f"                 dwell {hop_ms:g} ms, jitter {jitter:g}, "
+      f"period {period*1e3:.1f} ms  <-- must match the transmitter exactly")
 print(f"  tuning       : {if_hz/1e6:.3f} MHz at {fs/1e6:g} MS/s "
-      f"({fs*0.8/1e6:.1f} MHz usable, ladder spans {span/1e6:.3f} MHz)")
-print(f"  listening    : {secs:g} s = {secs/total:.1f} ladder cycles")
-print(f"  frame        : {frame} = {frame/fs*1e3:.2f} ms "
-      f"({u/(frame/fs):.1f} frames in the shortest burst)")
-if secs < total * 1.2:
-    print(f"  WARNING: {secs:g} s is under one full {total:g} s cycle plus the "
-          f"longest burst.\n"
-          f"           Raise SECONDS_LISTEN to at least "
-          f"{total + u*steps:.1f} s or no rung is guaranteed to arrive whole.")
+      f"({fs*0.8/1e6:.2f} MHz usable)")
+print(f"  listening    : {secs:g} s = {secs/period:.1f} periods, "
+      f"{int(secs/(hop_ms/1e3))} hops")
+print(f"  frame        : {frame} = {frame_s*1e3:.3f} ms "
+      f"({hop_ms/1e3/frame_s:.1f} frames per dwell, "
+      f"{fs/frame/1e3:.2f} kHz per bin)")
+
 if span > fs * 0.8:
-    print("  WARNING: ladder span exceeds the usable bandwidth; raise FS")
-if u / (frame / fs) < 4:
-    print("  WARNING: shortest burst spans under 4 frames; lower FRAME")
+    print(f"  WARNING: span {span/1e6:.3f} MHz exceeds the usable bandwidth "
+          f"{fs*0.8/1e6:.3f} MHz;\n"
+          f"           raise FS or narrow the span, or the outer points are "
+          f"simply not there")
+if hop_ms / 1e3 / frame_s < 4:
+    print(f"  WARNING: a dwell spans only {hop_ms/1e3/frame_s:.1f} frames; "
+          f"lower FRAME (want 20+)")
+if frame_s > hop_ms / 1e3:
+    print(f"  WARNING: a frame is longer than a dwell; every frame straddles "
+          f"hops and nothing will align")
+if secs < 4 * period:
+    print(f"  WARNING: {secs:g} s is under four periods ({4*period:.2f} s); "
+          f"raise SECONDS_LISTEN")
+if fs / frame > span / (points - 1) / 2:
+    print(f"  WARNING: bin width {fs/frame/1e3:.1f} kHz is coarse against the "
+          f"{span/(points-1)/1e3:.1f} kHz spacing; raise FRAME")
 PY
 echo
 
-cd "$UTILS"
-exec uv run python "$LISTENER" \
-    --if-hz "$IF_HZ" \
-    --seconds "$SECONDS_LISTEN" \
-    --fs "$FS" \
-    --frame-size "$FRAME" \
-    --gain "$GAIN" \
-    --uri "$URI" \
-    --rung-start-hz "$(python3 -c "print(float('$START_GHZ')*1e9)")" \
-    --rung-stop-hz  "$(python3 -c "print(float('$STOP_GHZ')*1e9)")" \
-    --rung-count "$STEPS" \
-    --total-seconds "$TOTAL_S" \
-    --lo-hz "$LO_HZ" \
+exec "${RUNNER[@]}" "$DECODER" \
+    --seed          "$SEED" \
+    --start-ghz     "$START_GHZ" \
+    --stop-ghz      "$STOP_GHZ" \
+    --points        "$POINTS" \
+    --min-hop-ms    "$HOP_MS" \
+    --jitter        "$JITTER" \
+    --period-cycles "$PERIOD_CYCLES" \
+    --lo-hz         "$LO_HZ" \
+    --lo-error-hz   "$LO_ERROR_HZ" \
+    --fs            "$FS" \
+    --frame         "$FRAME" \
+    --seconds       "$SECONDS_LISTEN" \
+    --gain          "$GAIN" \
+    --uri           "$URI" \
     "$@"

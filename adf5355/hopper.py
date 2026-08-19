@@ -49,8 +49,20 @@ from dataclasses import dataclass
 _MASK = (1 << 64) - 1
 DEFAULT_SEED = 0xC0FFEE
 DEFAULT_POINTS = 20
-DEFAULT_MIN_HOP_S = 0.005
+# Precision tracks dwell, because dwell is integration time. Measured on the
+# bench over 8 s captures, 20 points: 2 ms gave 2946 Hz sd, 5 ms 1361 Hz,
+# 10 ms 730 Hz. 10 ms it is; both ends default to the same number.
+DEFAULT_MIN_HOP_S = 0.010
 DEFAULT_JITTER = 0.0     # fixed dwell: the frequency order carries identity
+DEFAULT_PERIOD_CYCLES = 1
+# 300 permutations of 20 points at 10 ms is 60 s: long enough to start the
+# transmitter, walk to the receiver, and still capture 8 s of it.
+DEFAULT_CYCLES = 300
+
+# A span narrow enough to sit inside a 2.5 MS/s receiver's instantaneous
+# bandwidth, so one tuning hears every point: 20 points, 90 kHz apart.
+DEFAULT_HOP_START_HZ = 11_000_000_000
+DEFAULT_HOP_STOP_HZ = 11_001_710_000
 
 
 class SplitMix64:
@@ -114,7 +126,7 @@ def _permutation(rng: SplitMix64, n: int) -> list[int]:
 
 def make_schedule(seed: int, freqs: list[int], min_hop_s: float,
                   cycles: int, jitter: float = DEFAULT_JITTER,
-                  period_cycles: int = 1) -> list[Hop]:
+                  period_cycles: int = DEFAULT_PERIOD_CYCLES) -> list[Hop]:
     """Regenerate the exact hop sequence from the shared parameters.
 
     The pattern repeats every ``period_cycles`` permutations. Periodicity is
@@ -150,7 +162,8 @@ def make_schedule(seed: int, freqs: list[int], min_hop_s: float,
     return hops
 
 
-def period_duration(hops: list[Hop], points: int, period_cycles: int = 1) -> float:
+def period_duration(hops: list[Hop], points: int,
+                    period_cycles: int = DEFAULT_PERIOD_CYCLES) -> float:
     """Wall time of one repeat of the pattern -- the receiver's search range."""
     n = points * period_cycles
     return hops[n].start_s if len(hops) > n else hops[-1].end_s

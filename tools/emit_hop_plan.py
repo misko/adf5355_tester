@@ -15,10 +15,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from adf5355 import Channel, SynthConfig, plan
-from adf5355.hopper import make_schedule, plan_frequencies
+from adf5355.hopper import make_period, plan_frequencies
 from adf5355.registers import FIELDS
 
-MAGIC = 0x34354441  # "AD54" little endian -- v2 carries the cold start
+MAGIC = 0x35354441  # "AD55" little endian -- v3 carries one period plus a count
+
+# v3 exists because v2 stored the whole run. The schedule repeats, so the plan
+# now carries a single period and the number of hops to play; the transmitter
+# indexes it modulo the period length. Memory is then set by the period, not by
+# how long the run lasts, which is what makes an indefinite loop possible.
 
 
 def main() -> int:
@@ -29,7 +34,12 @@ def main() -> int:
     p.add_argument("--stop-ghz", type=float, default=11.00171)
     p.add_argument("--points", type=int, default=20)
     p.add_argument("--hop-ms", type=float, default=10.0)
-    p.add_argument("--cycles", type=int, default=100)
+    p.add_argument("--cycles", type=int, default=100,
+                   help="how many permutations to play; ignored with --forever")
+    p.add_argument("--forever", action="store_true",
+                   help="loop until signalled -- total hop count is left at 0")
+    p.add_argument("--period-cycles", type=int, default=1,
+                   help="permutations per repeat of the pattern")
     p.add_argument("--ref-mhz", type=float, default=125.0)
     p.add_argument("--power", type=int, default=0)
     p.add_argument("--channel", default="B", choices=["A", "B"])
@@ -41,7 +51,9 @@ def main() -> int:
     channel = Channel(args.channel)
     freqs = plan_frequencies(round(args.start_ghz * 1e9),
                              round(args.stop_ghz * 1e9), args.points)
-    hops = make_schedule(args.seed, freqs, args.hop_ms / 1e3, args.cycles)
+    period = make_period(args.seed, len(freqs), args.hop_ms / 1e3,
+                         period_cycles=args.period_cycles)
+    total_hops = 0 if args.forever else args.cycles * len(freqs)
 
     cfg_on = SynthConfig(ref_hz=round(args.ref_mhz * 1e6),
                          outa_enable=channel is Channel.A,
@@ -61,8 +73,7 @@ def main() -> int:
                  freqs[0], channel).registers.word(6)
     r6_off = plan(cfg_off, freqs[0], channel).registers.word(6)
 
-    index = {f: i for i, f in enumerate(freqs)}
-    seq = [index[h.freq_hz] for h in hops]
+    seq = [point for point, _dwell in period]
     dwell_ns = int(round(args.hop_ms * 1e6))
 
     # The C side must be able to bring the part up on its own: without a cold
@@ -73,8 +84,8 @@ def main() -> int:
     delay_us = boot.delay_us
 
     with open(args.out, "wb") as fh:
-        fh.write(struct.pack("<IIIQII", MAGIC, len(freqs), len(seq),
-                             dwell_ns, r6_on, r6_off))
+        fh.write(struct.pack("<IIIQQII", MAGIC, len(freqs), len(seq),
+                             total_hops, dwell_ns, r6_on, r6_off))
         fh.write(struct.pack("<I", delay_us))
         for w in boot_words:                     # 13 words, R0 first
             fh.write(struct.pack("<I", w))
@@ -83,10 +94,12 @@ def main() -> int:
         for s in seq:
             fh.write(struct.pack("<H", s))
 
+    span = "forever" if total_hops == 0 else f"{total_hops*args.hop_ms/1000:.2f} s"
     print(f"{args.out}: cold start {len(boot_words)} regs, "
           f"autocal settle {delay_us} us, "
-          f"{len(freqs)} points, {len(seq)} hops, "
-          f"{args.hop_ms:g} ms dwell, {len(seq)*args.hop_ms/1000:.2f} s, "
+          f"{len(freqs)} points, period {len(seq)} hops "
+          f"({len(seq)*args.hop_ms/1000:.4f} s), plays {span}, "
+          f"{args.hop_ms:g} ms dwell, "
           f"R6 on 0x{r6_on:08X} off 0x{r6_off:08X}")
     return 0
 

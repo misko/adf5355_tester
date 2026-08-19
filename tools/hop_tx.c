@@ -11,11 +11,18 @@
  *     accumulate, with a short spin to cover the timer's own granularity
  *   - no allocator and no collector in the timed path at all
  *
- * Plan file (little endian):
- *   magic "AD53" u32 | points u32 | hops u32 | dwell_ns u64
- *   r6_on u32 | r6_off u32
- *   points x 3 u32   (R1, R2, R0-without-autocal per point)
- *   hops x u16       (point index per hop)
+ * Plan file v3 (little endian):
+ *   magic "AD55" u32 | points u32 | period_len u32 | total_hops u64
+ *   dwell_ns u64 | r6_on u32 | r6_off u32 | delay_us u32 | boot 13 x u32
+ *   points x 3 u32       (R1, R2, R0-without-autocal per point)
+ *   period_len x u16     (point index per hop, ONE period)
+ *
+ * The plan carries one period, not the whole run: the schedule repeats, so
+ * the sequence is indexed modulo period_len and memory is set by the period
+ * rather than by how long the transmitter runs. total_hops == 0 means loop
+ * until signalled. Lateness is accumulated into a fixed histogram for the
+ * same reason -- a per-hop array is unbounded in a run meant to continue
+ * indefinitely, which is exactly what sank the Python transmitter.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -29,7 +36,36 @@
 #include <sched.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
+#include <signal.h>
 #include <linux/spi/spidev.h>
+
+/* Lateness histogram: 1 us buckets. Fixed 256 KiB, independent of run length. */
+#define HB 65536
+static uint32_t hist[HB];
+static uint64_t hist_n, hist_over;
+static int64_t  hist_max = 0;
+
+static void hist_add(int64_t late_ns)
+{
+    if (late_ns > hist_max) hist_max = late_ns;
+    int64_t us = late_ns < 0 ? 0 : late_ns / 1000;
+    if (us >= HB) hist_over++; else hist[us]++;
+    hist_n++;
+}
+
+/* Smallest bucket whose cumulative count reaches the requested quantile. */
+static double hist_q(double q)
+{
+    uint64_t want = (uint64_t)(q * (double)hist_n), acc = 0;
+    for (uint32_t i = 0; i < HB; i++){
+        acc += hist[i];
+        if (acc >= want) return (double)i;
+    }
+    return (double)HB;
+}
+
+static volatile sig_atomic_t stop_now = 0;
+static void on_signal(int sig){ (void)sig; stop_now = 1; }
 
 /* Spin margin. Longer spin costs CPU but removes the wake-up from the path.
  * Overridable so the trade can be measured rather than guessed. */
@@ -80,9 +116,6 @@ static void wait_until(int64_t deadline_ns){
     }
     do { clock_gettime(CLOCK_MONOTONIC, &now); } while (ns_of(&now) < deadline_ns);
 }
-static int cmp_i64(const void *a, const void *b){
-    int64_t x=*(const int64_t*)a, y=*(const int64_t*)b; return x<y?-1:x>y;
-}
 
 int main(int argc, char **argv){
     if (argc < 3){
@@ -97,18 +130,22 @@ int main(int argc, char **argv){
 
     FILE *f = fopen(argv[1], "rb");
     if (!f){ perror("plan"); return 1; }
-    uint32_t magic, points, hops, r6_on, r6_off; uint64_t dwell_ns;
-    if (fread(&magic,4,1,f)!=1 || magic != 0x34354441u){ /* "AD54" LE */
-        fprintf(stderr, "bad plan magic\n"); return 1; }
-    fread(&points,4,1,f); fread(&hops,4,1,f); fread(&dwell_ns,8,1,f);
+    uint32_t magic, points, period_len, r6_on, r6_off;
+    uint64_t total_hops, dwell_ns;
+    if (fread(&magic,4,1,f)!=1 || magic != 0x35354441u){ /* "AD55" LE */
+        fprintf(stderr, "bad plan magic (need v3; re-run emit_hop_plan.py)\n");
+        return 1; }
+    fread(&points,4,1,f); fread(&period_len,4,1,f);
+    fread(&total_hops,8,1,f); fread(&dwell_ns,8,1,f);
     fread(&r6_on,4,1,f);  fread(&r6_off,4,1,f);
+    if (period_len == 0){ fprintf(stderr, "empty period\n"); return 1; }
     uint32_t delay_us = 0, boot[13];
     fread(&delay_us,4,1,f);
     fread(boot, sizeof(uint32_t), 13, f);
     uint32_t *tbl = malloc(points*3*sizeof(uint32_t));
-    uint16_t *seq = malloc(hops*sizeof(uint16_t));
+    uint16_t *seq = malloc(period_len*sizeof(uint16_t));
     fread(tbl, sizeof(uint32_t), points*3, f);
-    fread(seq, sizeof(uint16_t), hops, f);
+    fread(seq, sizeof(uint16_t), period_len, f);
     fclose(f);
 
     spi_fd = open(dev, O_RDWR);
@@ -130,9 +167,11 @@ int main(int argc, char **argv){
     }
     /* Touch the whole working set so no page fault lands mid-dwell. */
     for (uint32_t i=0;i<points*3;i++) (void)tbl[i];
-    for (uint32_t i=0;i<hops;i++)   (void)seq[i];
+    for (uint32_t i=0;i<period_len;i++) (void)seq[i];
+    memset(hist, 0, sizeof hist);            /* fault it in before timing */
 
-    int64_t *late = malloc(hops*sizeof(int64_t));
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
 
     /* Cold start: R12 down to R1, wait out the VCO band-select ADC, then R0
      * with autocal. Without this the part keeps whatever band the previous
@@ -148,13 +187,16 @@ int main(int argc, char **argv){
 
     struct timespec start; clock_gettime(CLOCK_MONOTONIC, &start);
     int64_t t0 = ns_of(&start);
-    for (uint32_t i = 0; i < hops; i++){
+    uint64_t played = 0;
+    for (uint64_t i = 0; total_hops == 0 || i < total_hops; i++){
+        if (stop_now) break;
         int64_t deadline = t0 + (int64_t)(i+1) * (int64_t)dwell_ns;
         wait_until(deadline);
         struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
-        late[i] = ns_of(&now) - deadline;
-        if (i+1 < hops){
-            const uint32_t *w = &tbl[seq[i+1]*3];
+        hist_add(ns_of(&now) - deadline);
+        played++;
+        if (total_hops == 0 || i+1 < total_hops){
+            const uint32_t *w = &tbl[seq[(i+1) % period_len]*3];
             wr(w[0]); wr(w[1]); wr(w[2]);
         }
     }
@@ -162,17 +204,17 @@ int main(int argc, char **argv){
     struct timespec done; clock_gettime(CLOCK_MONOTONIC, &done);
     double elapsed = (ns_of(&done) - t0)/1e9;
 
-    qsort(late, hops, sizeof(int64_t), cmp_i64);
-    int64_t half = (int64_t)dwell_ns/2; uint32_t over = 0;
-    for (uint32_t i=0;i<hops;i++) if (late[i] > half) over++;
+    uint64_t half_us = dwell_ns/2000; uint64_t over = hist_over;
+    for (uint64_t i = half_us; i < HB; i++) over += hist[i];
     fprintf(stderr,
-      "{\"impl\":\"c\",\"hops\":%u,\"dwell_us\":%.3f,\"elapsed_s\":%.6f,"
-      "\"sched_s\":%.6f,\"median_us\":%.3f,\"p99_us\":%.3f,\"max_us\":%.3f,"
-      "\"late\":%u,\"rt\":%d,\"mlock\":%d,\"spi_hz\":%u,"
-      "\"spin_us\":%ld,\"cpu\":%d,\"pinned\":%d,\"pmqos\":%d}\n",
-      hops, dwell_ns/1000.0, elapsed, (double)hops*dwell_ns/1e9,
-      late[hops/2]/1000.0, late[(uint32_t)(0.99*hops)]/1000.0,
-      late[hops-1]/1000.0, over, rt, locked, spi_speed,
+      "{\"impl\":\"c\",\"hops\":%llu,\"period\":%u,\"dwell_us\":%.3f,"
+      "\"elapsed_s\":%.6f,\"sched_s\":%.6f,\"median_us\":%.3f,"
+      "\"p99_us\":%.3f,\"max_us\":%.3f,\"late\":%llu,\"rt\":%d,"
+      "\"mlock\":%d,\"spi_hz\":%u,\"spin_us\":%ld,\"cpu\":%d,"
+      "\"pinned\":%d,\"pmqos\":%d}\n",
+      (unsigned long long)played, period_len, dwell_ns/1000.0, elapsed,
+      (double)played*dwell_ns/1e9, hist_q(0.5), hist_q(0.99),
+      hist_max/1000.0, (unsigned long long)over, rt, locked, spi_speed,
       spin_ns/1000L, cpu_pin, pinned, latency_fd >= 0);
     close(spi_fd);
     if (latency_fd >= 0) close(latency_fd);   /* releases the PM QoS hold */

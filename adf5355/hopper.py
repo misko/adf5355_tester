@@ -130,6 +130,33 @@ def _permutation(rng: SplitMix64, n: int) -> list[int]:
     return order
 
 
+def make_period(seed: int, points: int, min_hop_s: float,
+                jitter: float = DEFAULT_JITTER,
+                period_cycles: int = DEFAULT_PERIOD_CYCLES
+                ) -> list[tuple[int, float]]:
+    """One period of (point index, dwell) -- the run is this, repeated.
+
+    The whole schedule is periodic by construction, so anything that only
+    needs to *play* it needs this and nothing more. Materialising the full
+    run instead costs memory linear in its length, which for a transmitter
+    meant to loop indefinitely is unbounded: a 200-point schedule asked to
+    run 2,000,000 cycles is 400 million entries, and the Python transmitter
+    duly tried to allocate all of them before emitting a single hop.
+    """
+    if min_hop_s <= 0:
+        raise ValueError("min_hop_s must be positive")
+    if not 0.0 <= jitter <= 1.0:
+        raise ValueError("jitter must be between 0 and 1")
+    if period_cycles < 1:
+        raise ValueError("period_cycles must be at least 1")
+    rng = SplitMix64(seed)
+    period: list[tuple[int, float]] = []
+    for _ in range(period_cycles):
+        for point in _permutation(rng, points):
+            period.append((point, min_hop_s * (1.0 + jitter * rng.uniform() * 2.0)))
+    return period
+
+
 def make_schedule(seed: int, freqs: list[int], min_hop_s: float,
                   cycles: int, jitter: float = DEFAULT_JITTER,
                   period_cycles: int = DEFAULT_PERIOD_CYCLES) -> list[Hop]:
@@ -149,13 +176,7 @@ def make_schedule(seed: int, freqs: list[int], min_hop_s: float,
         raise ValueError("jitter must be between 0 and 1")
     if period_cycles < 1:
         raise ValueError("period_cycles must be at least 1")
-    rng = SplitMix64(seed)
-
-    # One period of (point, dwell), then repeated.
-    period: list[tuple[int, float]] = []
-    for _ in range(period_cycles):
-        for point in _permutation(rng, len(freqs)):
-            period.append((point, min_hop_s * (1.0 + jitter * rng.uniform() * 2.0)))
+    period = make_period(seed, len(freqs), min_hop_s, jitter, period_cycles)
 
     hops: list[Hop] = []
     t = 0.0

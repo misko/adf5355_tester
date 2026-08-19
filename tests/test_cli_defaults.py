@@ -189,3 +189,53 @@ class TestChannelDefaults(unittest.TestCase):
             parser.parse_args(["ladder", "--channel", "A"])).value, "A")
         self.assertEqual(cli.resolve_channel(
             parser.parse_args(["dump", "--freq", "11.7G", "--channel", "B"])).value, "B")
+
+
+class TestNoSharedDefaultMutation(unittest.TestCase):
+    """Guard the whole class of bug, not just the --channel instance.
+
+    Options declared on a `parents=[common]` parser are the SAME action objects
+    in every subparser. argparse's set_defaults() writes through to
+    `action.default`, so one subcommand setting a default for an inherited
+    option silently changes it for all of them. That is how `ladder` flipped
+    every other subcommand to channel B.
+    """
+
+    @staticmethod
+    def _subparsers(parser):
+        import argparse
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                return action.choices
+        raise AssertionError("no subparsers found")
+
+    def test_no_subcommand_sets_a_default_for_an_inherited_option(self):
+        parser = cli.build_parser()
+        subs = self._subparsers(parser)
+
+        counts = {}
+        for sub in subs.values():
+            for action in sub._actions:
+                entry = counts.setdefault(id(action), [action, 0])
+                entry[1] += 1
+        shared = {action.dest for action, n in counts.values() if n > 1}
+
+        for name, sub in subs.items():
+            for dest in getattr(sub, "_defaults", {}):
+                self.assertNotIn(
+                    dest, shared,
+                    f"subcommand {name!r} calls set_defaults({dest}=...) for an "
+                    f"option inherited from the shared parent parser. argparse "
+                    f"writes that through to the shared action, changing the "
+                    f"default for every other subcommand. Use a distinct dest "
+                    f"(see channel_default / resolve_channel).")
+
+    def test_the_six_point_eight_ghz_ambiguity_is_resolved_explicitly(self):
+        """6.8 GHz is valid on both outputs -- the one silent failure case."""
+        from adf5355 import Channel, plan
+        parser = cli.build_parser()
+        cfg_args = parser.parse_args(["dump", "--freq", "6.8G"])
+        self.assertEqual(cli.resolve_channel(cfg_args), Channel.A)
+        cfg = cli.build_config(cfg_args, True, False)
+        for channel in (Channel.A, Channel.B):
+            plan(cfg, 6_800_000_000, channel)   # both must be constructible

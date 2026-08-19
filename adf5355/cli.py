@@ -24,6 +24,10 @@ from .ladder import (make_ladder, format_ladder, run_ladder,
                      overlaps_satellite_band, check_schedule_feasible,
                      DEFAULT_START_HZ, DEFAULT_STOP_HZ, DEFAULT_STEPS,
                      DEFAULT_TOTAL_S)
+from .hopper import (DEFAULT_JITTER, DEFAULT_MIN_HOP_S, DEFAULT_POINTS,
+                     DEFAULT_SEED,
+                     describe as describe_hops, make_schedule,
+                     plan_frequencies, run_hops)
 from .plan import Channel, SynthConfig, plan
 from .registers import MuxOut, OutputPower
 
@@ -246,13 +250,72 @@ def cmd_ladder(args) -> int:
     dev = open_device(args, config)
     try:
         failures = run_ladder(dev, steps, channel, args.loops,
-                              None if args.no_lock_check else check)
+                              None if args.no_lock_check else check,
+                              verbose=steps[0].on_s >= 0.05)
     finally:
         dev.close()
     if failures:
         print(f"\n{failures} rung(s) failed to lock", file=sys.stderr)
         return 1
     print("\nladder complete; output muted")
+    return 0
+
+
+def cmd_hop(args) -> int:
+    """Seeded pseudorandom frequency hopping; the receiver regenerates it."""
+    channel = resolve_channel(args)
+    enable = args.enable_rf
+    try:
+        freqs = plan_frequencies(round(args.start_ghz * 1e9),
+                                 round(args.stop_ghz * 1e9), args.points)
+        hops = make_schedule(args.seed, freqs, args.min_hop_ms / 1e3,
+                             args.cycles, args.jitter)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    config = build_config(args, enable and channel is Channel.A,
+                          enable and channel is Channel.B)
+    for freq in freqs:                       # validate before transmitting
+        try:
+            plan(config, freq, channel)
+        except ValueError as exc:
+            print(f"error: {freq/1e9:.6f} GHz: {exc}", file=sys.stderr)
+            return 2
+
+    print(describe_hops(hops, freqs, args.seed, args.min_hop_ms / 1e3,
+                        args.jitter))
+    print(f"\n  the receiver needs only: seed 0x{args.seed:X}, "
+          f"{args.start_ghz}-{args.stop_ghz} GHz, {args.points} points, "
+          f"hop {args.min_hop_ms:g} ms, jitter {args.jitter:g}")
+    lo, hi = freqs[0], freqs[-1]
+    if lo <= SATBAND_HI_HZ and hi >= SATBAND_LO_HZ:
+        print("\nSAFETY: overlaps the 10.7-12.7 GHz satellite downlink band. "
+              "Closed, attenuated path only; do not radiate.")
+    else:
+        print("\nSAFETY: bench equipment. Do not connect an antenna.")
+
+    if not enable:
+        print("\nRF disabled, so nothing was transmitted. Re-run with "
+              "--enable-rf into a shielded/attenuated path.")
+        return 0
+
+    dev = open_device(args, config)
+    try:
+        if dev.can_detect_lock and not args.no_lock_check:
+            try:
+                dev.wait_for_lock(args.lock_timeout)
+            except LockTimeout as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
+        start = time.monotonic()
+        run_hops(dev, hops, channel)
+        elapsed = time.monotonic() - start
+    finally:
+        dev.close()
+    print(f"\ntransmitted {len(hops)} hops in {elapsed:.4f} s "
+          f"(scheduled {hops[-1].end_s:.4f} s, "
+          f"error {(elapsed - hops[-1].end_s)*1e3:+.1f} ms); output muted")
     return 0
 
 
@@ -404,6 +467,32 @@ def build_parser() -> argparse.ArgumentParser:
                     help="seconds to transmit before muting and exiting "
                          "(default 10)")
     dw.set_defaults(func=cmd_dwell)
+
+    hop = sub.add_parser("hop", parents=[common],
+                         help="seeded pseudorandom frequency hopping; a "
+                              "receiver knowing the seed regenerates it exactly")
+    hop.add_argument("--seed", type=lambda v: int(v, 0), default=DEFAULT_SEED,
+                     help=f"shared schedule seed (default 0x{DEFAULT_SEED:X}); "
+                          f"accepts 0x notation")
+    hop.add_argument("--start-ghz", type=float, default=11.0,
+                     help="first frequency point in GHz")
+    hop.add_argument("--stop-ghz", type=float, default=11.00171,
+                     help="last frequency point in GHz; the whole span should "
+                          "fit the receiver's instantaneous bandwidth")
+    hop.add_argument("--points", type=int, default=DEFAULT_POINTS,
+                     help=f"number of frequency points (default {DEFAULT_POINTS})")
+    hop.add_argument("--min-hop-ms", type=float,
+                     default=DEFAULT_MIN_HOP_S * 1e3,
+                     help=f"minimum dwell in ms (default "
+                          f"{DEFAULT_MIN_HOP_S*1e3:g}); each dwell is "
+                          f"min + rand(0,1)*min*2")
+    hop.add_argument("--jitter", type=float, default=DEFAULT_JITTER,
+                     help=f"dwell randomness 0..1 (default {DEFAULT_JITTER:g} = "
+                          f"fixed). dwell = min*(1 + jitter*rand*2); identity "
+                          f"comes from the frequency order, not from timing")
+    hop.add_argument("--cycles", type=int, default=100,
+                     help="permutations to transmit (default 100)")
+    hop.set_defaults(func=cmd_hop, channel_default="B")
 
     lad = sub.add_parser("ladder", parents=[common],
                          help="duration-coded ladder: rung n transmits for "

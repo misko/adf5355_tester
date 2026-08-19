@@ -148,7 +148,7 @@ def check_schedule_feasible(steps: list[LadderStep], *, minimum_ratio: float = 4
 
 
 def run_ladder(dev, steps: list[LadderStep], channel, loops: int = 1,
-               on_lock_failure=None) -> int:
+               on_lock_failure=None, verbose: bool = True) -> int:
     """Transmit the schedule.  Returns the number of rungs that failed to lock.
 
     Each rung's frequency is programmed during the previous rung's OFF window,
@@ -158,6 +158,8 @@ def run_ladder(dev, steps: list[LadderStep], channel, loops: int = 1,
     failures = 0
     dev.set_frequency(steps[0].freq_hz, channel)
     dev.set_output(channel, False)
+    if on_lock_failure is not None and not on_lock_failure(dev, steps[0]):
+        failures += 1
     time.sleep(0.050)
 
     for loop_no in range(1, loops + 1):
@@ -165,20 +167,29 @@ def run_ladder(dev, steps: list[LadderStep], channel, loops: int = 1,
             print(f"ladder {loop_no}/{loops}")
         t0 = time.monotonic()
         for i, step in enumerate(steps):
+            # The ON window must contain nothing but the two output writes and
+            # the wait. Retuning and lock detection happen in the preceding OFF
+            # window, while muted: waiting for lock here would stretch the burst
+            # to max(scheduled, lock time), which at a 10 ms unit destroys the
+            # duration coding the whole scheme rests on.
             dev.set_output(channel, True)
-            if on_lock_failure is not None and not on_lock_failure(dev, step):
-                failures += 1
-            print(f"  rung {step.index}: {step.freq_hz/1e9:.3f} GHz "
-                  f"ON {step.on_s:.3f} s")
             _sleep_until(t0 + step.on_end_s)
-
             dev.set_output(channel, False)
+
+            if verbose:
+                print(f"  rung {step.index}: {step.freq_hz/1e9:.6f} GHz "
+                      f"ON {step.on_s:.4f} s")
             if i + 1 < len(steps):
                 dev.set_frequency(steps[i + 1].freq_hz, channel)
+                if on_lock_failure is not None and \
+                        not on_lock_failure(dev, steps[i + 1]):
+                    failures += 1
             _sleep_until(t0 + step.end_s)
 
         elapsed = time.monotonic() - t0
-        print(f"  coded interval complete in {elapsed:.3f} s")
+        print(f"  cycle {loop_no}/{loops} complete in {elapsed:.4f} s "
+              f"(scheduled {steps[-1].end_s:.4f} s, "
+              f"error {(elapsed - steps[-1].end_s)*1e3:+.1f} ms)")
         if loop_no < loops:
             dev.set_frequency(steps[0].freq_hz, channel)
             dev.set_output(channel, False)

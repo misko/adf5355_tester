@@ -253,6 +253,7 @@ class TestEverySubcommandBuilds(unittest.TestCase):
         "dump": ["--freq", "2.4G"],
         "set": ["--freq", "2.4G"],
         "dwell": ["--freq", "2.4G"],
+        "hop": [],
         "ladder": [],
         "sweep": ["--start", "1G", "--stop", "2G"],
         "off": [],

@@ -9,7 +9,9 @@ The failure that matters for this tool is a *confident wrong answer*, so the
 last few tests feed it captures that hold no recoverable schedule (the wrong
 seed, and pure noise) and assert that it says so.
 """
+import contextlib
 import importlib.util
+import io
 import os
 import sys
 import tempfile
@@ -248,6 +250,84 @@ class TestItRefusesToBeConfidentlyWrong(unittest.TestCase):
         result = hd.decode(samples, frame=32768, **PLAN)
         self.assertTrue(any("frames" in w for w in result.warnings),
                         result.warnings)
+
+
+class TestTheBannerAndTheExitStatusAgree(unittest.TestCase):
+    """A scripted caller only sees the exit status; a human only sees the banner.
+
+    If those two can disagree, the tool prints "do not use these numbers as a
+    measurement" and hands the caller a zero anyway -- which is precisely the
+    confident-wrong-answer failure this decoder exists to avoid.
+    """
+
+    def _result(self, **overrides):
+        fields = dict(comb_offset_hz=-106e3, comb_sharpness=5000.0,
+                      epoch_s=0.037, epoch_sigma=1000.0, period_s=0.2,
+                      points=20, recovered=20, frame_s=2.048e-4, nframes=4882,
+                      seconds=1.0, slot_half_hz=27e3,
+                      rows=[hd.PointResult(p, 1.25e9, 1.25e9, 0.0, 200, 200,
+                                           30.0) for p in range(20)],
+                      warnings=[])
+        fields.update(overrides)
+        return hd.DecodeResult(**fields)
+
+    def test_a_clean_result_is_trusted_and_prints_no_banner(self):
+        result = self._result()
+        self.assertTrue(result.trustworthy)
+        self.assertNotIn("CONFIDENCE IS POOR", hd.format_report(result))
+
+    def test_a_partial_recovery_is_not_quietly_reported_as_success(self):
+        """15 of 20 points is a failure, not a measurement with a footnote."""
+        result = self._result(recovered=15, rows=self._result().rows[:15],
+                              warnings=["only 15 of 20 points recovered"])
+        self.assertIn("CONFIDENCE IS POOR", hd.format_report(result))
+        self.assertFalse(result.trustworthy)
+
+    def test_a_configuration_warning_also_fails_the_run(self):
+        result = self._result(warnings=["dwell spans 2.0 frames"])
+        self.assertIn("CONFIDENCE IS POOR", hd.format_report(result))
+        self.assertFalse(result.trustworthy)
+
+    def test_every_warning_the_decoder_can_raise_fails_the_run(self):
+        """Whatever earns the banner must set the exit status, without listing.
+
+        Enumerated from the decoder itself rather than restated, so a warning
+        added later cannot quietly come with a zero exit status attached.
+        """
+        for warning in ("comb sharpness", "epoch sigma", "only 3 of 20",
+                        "dwell spans", "span 4.000 MHz exceeds"):
+            with self.subTest(warning=warning):
+                result = self._result(warnings=[warning])
+                self.assertFalse(result.trustworthy)
+                self.assertIn("CONFIDENCE IS POOR", hd.format_report(result))
+
+    def test_main_exits_non_zero_on_a_capture_it_cannot_decode(self):
+        """End to end through main(), which is what a shell actually sees."""
+        rng = np.random.default_rng(5)
+        n = int(0.3 * FS)
+        noise = (rng.standard_normal(n) + 1j * rng.standard_normal(n))
+        with tempfile.TemporaryDirectory() as work:
+            path = os.path.join(work, "noise.iq")
+            hd.write_int16(path, noise.astype(np.complex64))
+            argv = ["--capture", path, "--fs", str(FS), "--seconds", "0.3"]
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                status = hd.main(argv)
+        self.assertEqual(status, 1)
+        self.assertIn("CONFIDENCE IS POOR", buffer.getvalue())
+
+    def test_main_exits_zero_on_a_capture_it_can_decode(self):
+        with tempfile.TemporaryDirectory() as work:
+            path = os.path.join(work, "good.iq")
+            samples = hd.synthesise(seconds=SECONDS, offset_hz=OFFSET,
+                                    start_at_s=EPOCH, snr_db=10.0, **PLAN)
+            hd.write_int16(path, samples)
+            argv = ["--capture", path, "--fs", str(FS)]
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                status = hd.main(argv)
+        self.assertEqual(status, 0)
+        self.assertIn("confidence good", buffer.getvalue())
 
 
 class TestBothEndsShareOneSchedule(unittest.TestCase):

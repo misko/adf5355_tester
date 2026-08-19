@@ -223,13 +223,19 @@ configuration tried**:
 | fixed 5 ms | 40 | 40/40 | 1552 Hz | −108.862 kHz | 37× |
 | jitter 5 ms | 40 | 40/40 | 1552 Hz | −108.862 kHz | 73× |
 
-*sd* is the point-to-point spread of the recovered errors; *sharpness* is the
-confidence figure the prototype decoder printed (how far the winning search
-position stood above the rest of the search). `tools/hop_decode.py` now reports
-two figures separately — comb sharpness and epoch sigma — and measures the epoch
-statistic against the *background* of the search rather than all of it, so a
-rerun prints a much larger sigma than the column above. Comb sharpness is
-comparable.
+*sd* is the point-to-point spread of the recovered errors. *sharpness* is the
+prototype decoder's **comb** confidence — the peak of the offset search over its
+median — which `tools/hop_decode.py` reports unchanged, so that column is
+directly comparable to what a rerun prints. The prototype's epoch confidence is
+not in the table; `tools/hop_decode.py` reports it separately as **epoch sigma**
+and measures it against the *background* of the search rather than against all
+of it, so a rerun prints a far larger sigma than the prototype ever did.
+
+The *comb offset* column is the coarse offset from step 2, whose only job is to
+place each point's slot; the measurement proper comes out of step 5, one median
+per point. Those per-point offsets came back at −105.6 to −106.6 kHz, agreeing
+with the −105.9 kHz measured independently by the older ladder method — the
+cross-check that says the number is real and not an artefact of the decoder.
 
 Two things fall out of that table:
 
@@ -237,10 +243,6 @@ Two things fall out of that table:
   cuts the spread by 4×. Ten milliseconds is the recommended default.
 - **Jitter buys nothing measurable.** Fixed dwell is therefore preferred: it is
   simpler, and it makes epoch alignment a uniform grid search.
-
-Recovered offsets of −105.6 to −106.6 kHz agree with the −105.9 kHz measured
-independently by the older ladder method, which is the cross-check that says
-the number is real and not an artefact of the decoder.
 
 ### Why it beats duration coding
 
@@ -330,9 +332,11 @@ numbers and shouts if either is poor:
 - **points recovered** — anything short of all of them says the span does not fit
   the passband, or the two ends disagree about the schedule.
 
-When any of those is poor the report prints a `CONFIDENCE IS POOR` banner and
-the tool exits non-zero, so a scripted run fails rather than quietly recording a
-number.
+Anything the run flags — either floor missed, a point short, a frame longer than
+a dwell, a span wider than the passband — prints a `CONFIDENCE IS POOR` banner
+*and* sets a non-zero exit status. The banner and the exit status are the same
+condition by construction, so a scripted run cannot record a number the report
+has just told a human not to use.
 
 ### Verifying it with no hardware at all
 

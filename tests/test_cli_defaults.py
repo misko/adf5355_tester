@@ -1,5 +1,7 @@
 """The reference default must stay pinned to this board's X1 marking."""
+import contextlib
 import importlib.util
+import io
 import os
 import sys
 import unittest
@@ -281,3 +283,81 @@ class TestEverySubcommandBuilds(unittest.TestCase):
                     if channel is Channel.B:
                         freq = 11_700_000_000
                 plan(cfg, freq, channel)
+
+
+class TestHopFlagsReachTheGenerator(unittest.TestCase):
+    """Every schedule flag must arrive at ``make_schedule`` unchanged.
+
+    A flag that parses, prints, and is then quietly dropped is worse than one
+    that does not exist: the operator sets it on both ends, the transmitter
+    ignores it, and the receiver aligns against a schedule that was never sent.
+    ``--period-cycles`` was pinned to 1 here once already. Nothing noticed.
+    """
+
+    def _record(self, argv):
+        recorded = {}
+        real = cli.make_schedule
+
+        def spy(seed, freqs, min_hop_s, cycles, jitter=0.0, period_cycles=1):
+            recorded.update(seed=seed, freqs=list(freqs), min_hop_s=min_hop_s,
+                            cycles=cycles, jitter=jitter,
+                            period_cycles=period_cycles)
+            return real(seed, freqs, min_hop_s, cycles, jitter, period_cycles)
+
+        cli.make_schedule = spy
+        try:
+            args = cli.build_parser().parse_args(argv)
+            with contextlib.redirect_stdout(io.StringIO()):
+                status = cli.cmd_hop(args)         # no --enable-rf: no device
+        finally:
+            cli.make_schedule = real
+        self.assertEqual(status, 0)
+        self.assertTrue(recorded, "cmd_hop never built a schedule")
+        return recorded
+
+    def test_non_default_flags_all_arrive(self):
+        from adf5355 import hopper
+        got = self._record(["hop", "--seed", "0x1234", "--start-ghz", "11.0",
+                            "--stop-ghz", "11.0002", "--points", "8",
+                            "--min-hop-ms", "3.5", "--jitter", "0.5",
+                            "--period-cycles", "4", "--cycles", "7"])
+        self.assertEqual(got["seed"], 0x1234)
+        self.assertEqual(got["freqs"],
+                         hopper.plan_frequencies(11_000_000_000,
+                                                 11_000_200_000, 8))
+        self.assertEqual(got["min_hop_s"], 0.0035)
+        self.assertEqual(got["jitter"], 0.5)
+        self.assertEqual(got["period_cycles"], 4)
+        self.assertEqual(got["cycles"], 7)
+
+    def test_the_bare_command_uses_the_packages_defaults(self):
+        from adf5355 import hopper
+        got = self._record(["hop"])
+        self.assertEqual(got["seed"], hopper.DEFAULT_SEED)
+        self.assertEqual(got["min_hop_s"], hopper.DEFAULT_MIN_HOP_S)
+        self.assertEqual(got["jitter"], hopper.DEFAULT_JITTER)
+        self.assertEqual(got["period_cycles"], hopper.DEFAULT_PERIOD_CYCLES)
+        self.assertEqual(got["cycles"], hopper.DEFAULT_CYCLES)
+        self.assertEqual(got["freqs"],
+                         hopper.plan_frequencies(hopper.DEFAULT_HOP_START_HZ,
+                                                 hopper.DEFAULT_HOP_STOP_HZ,
+                                                 hopper.DEFAULT_POINTS))
+
+    def test_the_schedule_it_prints_is_the_one_it_would_transmit(self):
+        """The preflight is the only view an operator gets before keying up."""
+        from adf5355 import hopper
+        args = cli.build_parser().parse_args(["hop", "--points", "6",
+                                              "--period-cycles", "2"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(cli.cmd_hop(args), 0)
+        freqs = hopper.plan_frequencies(hopper.DEFAULT_HOP_START_HZ,
+                                        hopper.DEFAULT_HOP_STOP_HZ, 6)
+        hops = hopper.make_schedule(hopper.DEFAULT_SEED, freqs,
+                                    hopper.DEFAULT_MIN_HOP_S,
+                                    hopper.DEFAULT_CYCLES,
+                                    hopper.DEFAULT_JITTER, 2)
+        first = ", ".join(f"p{h.point}@{h.dwell_s*1e3:.1f}ms" for h in hops[:8])
+        self.assertIn(first, out.getvalue())
+        self.assertIn("period-cycles 2", out.getvalue())
+

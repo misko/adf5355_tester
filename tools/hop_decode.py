@@ -32,8 +32,10 @@ The steps, in order:
    clear of that point's own noise floor.
 
 A confident wrong answer is the failure that matters here, so both confidence
-figures are printed every time and a poor one is called out loudly and sets a
-non-zero exit status.
+figures are printed every time. Anything the run flags -- a floor missed, a
+point not recovered, a frame longer than a dwell -- prints a loud banner AND
+sets a non-zero exit status; the two always agree, so a scripted caller cannot
+record a number the report has just disowned.
 
 The schedule is imported from ``adf5355.hopper``: transmitter and receiver run
 the same generator, so the two ends cannot drift apart.
@@ -86,9 +88,12 @@ MIN_FRAMES_PER_POINT = 5        # fewer than this and a point is not reported
 CHUNK_FRAMES = 4096             # frames per FFT batch, a memory/speed trade
 
 # Below either of these, treat the answer as unproven rather than as a
-# measurement. Synthetic captures put a genuine decode at thousands of x and
-# hundreds of sigma, and still clear these floors 20 dB into the noise; a wrong
-# seed scores under 5 sigma and pure noise under 2x. The bench runs that worked
+# measurement. Measured on synthetic captures at the recommended defaults: a
+# genuine decode at 10 dB SNR sits near 7000x and 700 sigma, a wrong seed under
+# 5 sigma, and pure noise under 2x. Both floors sit well clear of those failures
+# without being generous: by -20 dB SNR the comb search is itself hovering at
+# 8x, and long before that -- around -10 dB -- no frame clears the envelope
+# threshold any more, so no point is reported at all. The bench runs that worked
 # sat at 37-422x comb sharpness.
 MIN_COMB_SHARPNESS = 8.0
 MIN_EPOCH_SIGMA = 10.0
@@ -390,9 +395,16 @@ class DecodeResult:
 
     @property
     def trustworthy(self) -> bool:
-        return (self.comb_sharpness >= MIN_COMB_SHARPNESS
-                and self.epoch_sigma >= MIN_EPOCH_SIGMA
-                and self.recovered >= max(2, self.points // 2))
+        """True only when nothing at all was flagged.
+
+        This is deliberately the same condition that decides whether the report
+        prints its ``CONFIDENCE IS POOR`` banner, because the banner and the
+        exit status must never disagree. Anything that earns the banner --
+        including a partial recovery, or a frame size that straddles hops --
+        also fails a scripted run, so a caller cannot record a number the
+        report has just told a human not to use.
+        """
+        return bool(self.rows) and not self.warnings
 
     def to_dict(self) -> dict:
         out = {k: v for k, v in asdict(self).items() if k != "rows"}

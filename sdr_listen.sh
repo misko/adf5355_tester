@@ -19,7 +19,7 @@
 # Override from the environment, e.g.
 #     SECONDS_LISTEN=20 FS=3e6 ./sdr_listen.sh
 #
-# Anything after -- is passed to the decoder, e.g.
+# Any extra arguments are handed straight to the decoder, e.g.
 #     ./sdr_listen.sh --capture-out run.iq --json
 #
 set -euo pipefail

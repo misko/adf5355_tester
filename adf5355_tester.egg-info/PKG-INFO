@@ -10,35 +10,104 @@ Requires-Dist: lgpio
 
 # adf5355_tester
 
-ADF5355 wideband synthesizer (54 MHz – 13.6 GHz) driven from a Raspberry Pi.
+Control an ADF5355 wideband synthesizer (54 MHz – 13.6 GHz) from a Raspberry Pi.
+
+> ## ⚠️ Closed RF paths only — never radiate
+>
+> Everything in this repository is a **bench procedure into a closed, shielded,
+> attenuated path**. The hop, the ladder and the calibration described below are
+> theoretical exercises for conducted test setups only.
+>
+> **Never connect an antenna. Never transmit any of this over the air.**
+>
+> The default hop sits at 11.0 GHz and the default ladder occupies
+> 10.7–12.7 GHz, both *satellite downlink* spectrum. Terrestrial transmission there is prohibited in essentially every
+> jurisdiction, and even a few milliwatts near a dish or LNB can wipe out
+> reception well beyond your own bench. Keep the synthesiser output conducted:
+> coax into a load, an attenuator, or a shielded enclosure.
+
+Provides a single `adf5355` command for bring-up, register inspection, single-tone
+transmission, band sweeps with lock verification, and a **seeded pseudorandom
+frequency hop** that a downstream receiver can use to measure its own clock
+error — together with `tools/hop_decode.py`, the receive end that decodes it.
+
+The hop is the recommended method and is the one that works on the bench; the
+older duration-coded ladder is kept, and documented, but superseded.
+
+---
+
+## Install
+
+```bash
+uv tool install --editable ~/adf5355_tester
+```
+
+That puts `adf5355` on your PATH (`~/.local/bin`). Everything below also works
+without installing, as `python3 -m adf5355 <cmd>` from the repository root.
+
+SPI must be enabled once:
+
+```bash
+sudo raspi-config nonint do_spi 0     # or uncomment dtparam=spi=on in
+sudo reboot                           # /boot/firmware/config.txt
+```
+
+`sudo dtoverlay spi0-2cs` loads it immediately without rebooting.
+
+---
 
 ## Wiring
 
-| Raspberry Pi | Header pin | Board | Purpose |
+```
+   Raspberry Pi 4B                                   ADF5355 board
+   40-pin header
+  ┌────────────────────────┐                      ┌───────────────────────────┐
+  │ pin 19  GPIO10 / MOSI  │──────── DAT ────────▶│ DAT   serial data         │
+  │ pin 23  GPIO11 / SCLK  │──────── CLK ────────▶│ CLK   serial clock        │
+  │ pin 24  GPIO8  / CE0   │──────── LE  ────────▶│ LE    latch enable        │
+  │ pin 16  GPIO23         │──────── CE  ────────▶│ CE    chip enable         │
+  │ pin 35  GPIO19         │◀─────── MUX ─────────│ MUX   lock detect         │
+  │ pin 6   GND            │──────── GND ─────────│ GND                       │
+  └────────────────────────┘                      │                           │
+                                                  │ X1 = 125.000 MHz          │
+   external 3.3 V supply ────── VDD ─────────────▶│ VDD                       │
+              └───────────────── common GND ─────▶│ GND                       │
+                                                  │                           │
+                                                  │ OUT+  RFoutA   53 MHz–6.8 GHz
+                                                  │ OUT−  RFoutA   (50 Ω load)│
+                                                  │ OB    RFoutB   6.8–13.6 GHz
+                                                  │ REF+/REF−  external ref in│
+                                                  └───────────────────────────┘
+```
+
+| Pi signal | Header pin | Board | Purpose |
 |---|---|---|---|
 | GPIO10 / MOSI | 19 | DAT | Serial data |
 | GPIO11 / SCLK | 23 | CLK | Serial clock |
 | GPIO8 / CE0 | 24 | LE | Load enable / latch |
-| GPIO23 | 16 | CE | Chip enable — held low at startup, driven high to run |
-| GPIO19 | 35 | MUX | MUXOUT — lock detect and link probe |
+| GPIO23 | **16** | CE | Chip enable — note: *pin 16*, not pin 23 |
+| GPIO19 | 35 | MUX | Lock detect and link probe |
 | GND | 6 | GND | Common ground |
 
 SPI mode 0, MSB first, 1 MHz by default (the part accepts up to 50 MHz).
+
+**Which port emits what.** `OUT+`/`OUT−` are the RFoutA differential pair
+(53.125 MHz – 6.8 GHz); take the signal off `OUT+` and terminate `OUT−` into
+50 Ω, since leaving it open degrades the match. `OB` is RFoutB, the frequency
+doubler, and produces **only** 6.8–13.6 GHz — it is silent below that.
+`REF+`/`REF−` are *inputs* for an external reference; leave them unconnected
+when using the onboard oscillator.
 
 **CE0 is the correct pin for LE by construction.** The Pi holds CE0 low for the
 whole transfer and releases it high afterwards, so the 32 bits shift in with LE
 low and the trailing rising edge latches them. This requires all four bytes to
 go out in a *single* transfer — never one byte at a time.
 
-Enable SPI once with `sudo raspi-config nonint do_spi 0` (or uncomment
-`dtparam=spi=on` in `/boot/firmware/config.txt`). `sudo dtoverlay spi0-2cs`
-loads it immediately without a reboot.
+**Power the board from its own supply**, not the Pi's 3V3 pin. The ADF5355
+draws several hundred mA and the Pi rail is both current-limited and
+electrically noisy, which you pay for in phase noise. Tie the grounds together.
 
-Power the board from its own supply, not the Pi's 3V3 pin: the ADF5355 draws
-several hundred mA and the Pi rail is both current-limited and electrically
-noisy, which you would pay for in phase noise. Tie the grounds together.
-
-## The chip cannot be read back
+### The chip cannot be read back
 
 DAT is an input, there is no MISO, and no register is readable. MUXOUT is the
 only signal the ADF5355 can drive back. Two of its settings are static logic
@@ -46,81 +115,1136 @@ levels, so commanding it high and then low and watching the GPIO follow proves
 the entire chain — CE, CLK, DAT, LE and the chip's own register decode:
 
 ```bash
-python3 -m adf5355 probe
+adf5355 probe
 ```
+
+```
+MUXOUT commanded high -> read 1
+MUXOUT commanded low  -> read 0
+PASS: the ADF5355 is receiving and acting on SPI writes
+```
+
+Run this first whenever something does not work. `PASS` means the link is fine
+and any failure is downstream (reference, loop, lock). `FAIL` means the chip is
+not hearing you at all — check board power, CE, and the DAT/CLK/LE wiring.
 
 Without MUXOUT wired (`--muxout-gpio -1`) the part is entirely open loop: writes
 cannot be confirmed, lock cannot be detected, and the only way to know the
 synthesizer did what you asked is to measure the RF output.
 
-## Usage
+---
+
+## Commands
 
 ```bash
-python3 -m adf5355 dump  --freq 2.4G          # registers, no hardware
-python3 -m adf5355 set   --freq 2.4G --enable-rf --hold 5
-python3 -m adf5355 set   --freq 11.7G --channel B --enable-rf
-python3 -m adf5355 sweep --start 1G --stop 6G --points 51
-python3 -m adf5355 off
+adf5355 probe                                   # is the chip receiving writes?
+adf5355 dump   --freq 2.4G                      # registers, no hardware touched
+adf5355 set    --freq 2.4G --enable-rf --hold 5
+adf5355 dwell  --freq 2.4G --dwell 30 --enable-rf
+adf5355 hop       --enable-rf                   # seeded pseudorandom hop
+adf5355 hop-lever --enable-rf                   # the same, over a 1.2 GHz lever arm
+adf5355 ladder    --enable-rf                   # duration-coded (superseded)
+adf5355 sweep  --start 1G --stop 6G --points 51
+adf5355 off
 ```
 
-This board's reference is **125.000 MHz** (marked `R125.000` on X1), and that
-is the `--ref-mhz` default, so the examples above omit it. Pass `--ref-mhz`
-explicitly for any board whose X1 is marked otherwise. Passing the wrong value is the single most likely
-reason a sweep runs cleanly but never locks: the registers are computed against
-the assumed reference, so the VCO lands somewhere else entirely and only the
-points that happen to fall back inside 3.4-6.8 GHz will lock. If you see
-scattered `LOCK FAILED` lines with no frequency pattern, check this first.
+| Command | What it does |
+|---|---|
+| `probe` | Commands MUXOUT high then low and watches the GPIO follow. The only readback this part has. |
+| `dump` | Solves a frequency and prints the full register image with every field named, plus the write order. Touches no hardware. |
+| `set` | Programs one frequency, optionally holding it with `--hold`. |
+| `dwell` | Transmits one frequency for `--dwell` seconds, then mutes and exits. |
+| `hop` | Seeded pseudorandom frequency hop — the recommended calibration pattern, see below. |
+| `hop-lever` | The same schedule spread over several widely separated clusters, so a receiver can separate its own clock error from the LNB's LO error. See [The frequency lever arm](#the-frequency-lever-arm-separating-d_rx-from-d_lnb). |
+| `ladder` | Duration-coded ladder — superseded by `hop`, see below. |
+| `sweep` | Steps a range and checks lock at every point. Exits non-zero if any point fails. |
+| `off` | Disables both outputs. |
+
+**RF is never enabled without `--enable-rf`.** Without it the PLL is fully
+programmed and locks, but both outputs stay off — which is how you verify lock
+across a whole band without transmitting. `--dry-run` computes everything and
+touches no hardware at all.
+
+### Reference frequency
+
+This board's reference is **125.000 MHz** (marked `R125.000` on X1), and that is
+the `--ref-mhz` default, so the examples omit it. Pass `--ref-mhz` explicitly for
+any board whose X1 is marked otherwise.
+
+Getting this wrong is the single most likely reason a sweep runs cleanly but
+never locks. The registers are computed against the assumed reference, so a
+wrong value scales every VCO target by the ratio of real to assumed reference;
+only the points that happen to land back inside 3.4–6.8 GHz will lock. **If you
+see scattered `LOCK FAILED` lines with no frequency pattern, check this first.**
 
 ### Output power
 
-`--power` selects one of the four RFoutA steps: `0` = -4 dBm (the default),
-`1` = -1, `2` = +2, `3` = +5 dBm. It defaults to the lowest step so that
-forgetting the flag cannot damage whatever is on the other end of the cable;
-raise it deliberately. There is no finer control on this part -- use an
-external attenuator. RFoutB has enable only, no power setting, so `--power`
-does nothing on `--channel B`.
-
-### Transmitting a single tone
-
-```bash
-python3 -m adf5355 dwell --freq 2.4G --dwell 30 --enable-rf
-```
-
-Programs one frequency, confirms lock, transmits for `--dwell` seconds
-(default 10), then mutes and exits. It mutes on Ctrl-C too. Without
-`--enable-rf` there is nothing to dwell on, so it reports and exits at once.
+`--power` selects one of four RFoutA steps: `0` = −4 dBm (**default**), `1` = −1,
+`2` = +2, `3` = +5 dBm. It defaults to the lowest step so that forgetting the
+flag cannot damage whatever is on the other end of the cable — +5 dBm is already
+past a PlutoSDR front end's limit. There is no finer control on this part; use
+an external attenuator. RFoutB has enable only, so `--power` does nothing on
+`--channel B`.
 
 ### Pacing a sweep
 
-`--dwell` sets how long each point is held after it locks (default `0.02` s);
-`--points` sets the resolution. To follow a sweep on an analyser:
+`--dwell` is how long each point is held after it locks (default `0.02` s) and
+`--points` is the resolution. To follow a sweep on an analyser:
 
 ```bash
-python3 -m adf5355 sweep --start 1G --stop 6G --points 51 --dwell 1
+adf5355 sweep --start 1G --stop 6G --points 51 --dwell 1
 ```
 
 `--lock-timeout` (default `0.5` s) is how long to wait before calling a point
-failed -- a healthy lock takes single-digit milliseconds. To park on one
-frequency instead, use `set --hold`.
+failed; a healthy lock takes single-digit milliseconds.
 
-`--ref-mhz` is required and never guessed: clone boards ship different
-oscillators, and every register depends on it. Read the marking on X1.
+---
 
-RF is never enabled without `--enable-rf`. `--dry-run` computes everything and
-touches no hardware.
+## Seeded frequency hopping (recommended)
+
+**This is what works on the bench, and it is what the two runner scripts drive.**
+The synthesiser hops among a set of frequencies in an order derived entirely
+from a shared seed. The receiver knows the seed, so it regenerates the identical
+schedule and never has to work out *which* point it is hearing — only *when* the
+pattern started, which is a single one-dimensional search. Nothing is encoded in
+burst length, and no control channel between the two ends is needed.
+
+```bash
+./adf5355_rf_hop.sh      # transmit; leave it running
+./sdr_listen.sh          # listen once, decode, report per-point error
+```
+
+That is the whole procedure. Both scripts print the schedule they are working
+from before they do anything, so a mismatch between the two ends is visible
+rather than silent — and the settings blocks at the top of each are checked
+against each other by the test suite, because that drift is the failure this
+design exists to prevent.
+
+### Measured: hopping decodes, duration coding does not
+
+Both methods were run over the same chain (ADF5355 → LNB → PlutoSDR at
+2.5 MS/s, 8 s captures). The duration-coded ladder **never identified more than
+1 burst in 95**. Seeded hopping identified **100% of points in every
+configuration tried**:
+
+| dwell | points | identified | sd | recovered comb offset | sharpness |
+|---|---:|---:|---:|---:|---:|
+| fixed 2 ms | 20 | 20/20 | 2946 Hz | −110.693 kHz | 38× |
+| fixed 5 ms | 20 | 20/20 | 1361 Hz | −108.252 kHz | 137× |
+| **fixed 10 ms** | **20** | **20/20** | **730 Hz** | **−107.336 kHz** | **422×** |
+| fixed 5 ms | 40 | 40/40 | 1552 Hz | −108.862 kHz | 37× |
+
+*sd* is the point-to-point spread of the recovered errors. *sharpness* is the
+prototype decoder's **comb** confidence — the peak of the offset search over its
+median — which `tools/hop_decode.py` reports unchanged, so that column is
+directly comparable to what a rerun prints. The prototype's epoch confidence is
+not in the table; `tools/hop_decode.py` reports it separately as **epoch sigma**
+and measures it against the *background* of the search rather than against all
+of it, so a rerun prints a far larger sigma than the prototype ever did.
+
+The *comb offset* column is the coarse offset from step 2, whose only job is to
+place each point's slot; the measurement proper comes out of step 5, one median
+per point. Those per-point offsets came back at −105.6 to −106.6 kHz, agreeing
+with the −105.9 kHz measured independently by the older ladder method — the
+cross-check that says the number is real and not an artefact of the decoder.
+
+### How long to listen
+
+The transmitted pattern repeats every `points x dwell` — **200 ms** at the
+defaults. That period, not the capture length, is what governs everything.
+Measured against a continuously looping transmitter, varying only
+`SECONDS_LISTEN`:
+
+| listen | periods | points | comb | epoch sigma | point sd | decode |
+|---|---:|---:|---:|---:|---:|---:|
+| 0.1 s | 0.50 | **3/20** | 96x | **5.5** | 10979 Hz | **refused** |
+| 0.2 s | 1.00 | 20/20 | 149x | 20.8 | 64 Hz | 2.4 s |
+| 0.4 s | 2.00 | 20/20 | 138x | 20.9 | 71 Hz | 3.0 s |
+| **2 s** | **10** | **20/20** | **145x** | **19.8** | **56 Hz** | **7.6 s** |
+| 8 s | 40 | 20/20 | 148x | 20.4 | 61 Hz | 22.8 s |
+| 32 s | 160 | 20/20 | 143x | 20.7 | 57 Hz | 85.3 s |
+
+**One period is a hard floor, and everything above it is flat.** At half a
+period only half the points are ever transmitted during the capture, so most are
+unobservable however good the decoder is: it recovered 3 of 20, scored 5.5 sigma
+against a floor of 10, and refused — an answer that would otherwise have been
+**90 kHz wrong** (−16 kHz against a true −106 kHz). That refusal is the point of
+the confidence gate.
+
+From one period upward, nothing improves with more capture. Point-to-point
+spread sits at 56–71 Hz across a 320-fold range of listen time. If it were
+noise-limited it would fall as the square root of time and 32 s would beat
+0.2 s by twelvefold; it does not move at all, so **~60 Hz was a systematic
+floor**.
+
+**That floor has since been identified and removed, and it was ours.** It was
+not receiver bias: it was the decoder fitting a parabola through three
+log-magnitude bins of a Hann-windowed frame, which is a biased fit whose error
+is a fixed function of where the tone sits inside its bin. Every point sits at
+its own fixed fractional bin position, so every point collected its own fixed
+error — the same error in every frame, of every visit, of every capture, which
+is exactly why averaging never touched it. Reproduced with **no noise at all**,
+the twenty points of the standard plan spread by **58 Hz sd**, against the
+56–71 Hz the bench measured. See
+[Measuring each point](#measuring-each-point-the-estimator) below; the
+whole-dwell estimator that replaced it spreads by **0.038 Hz** on the same
+input, and it does fall with listen time.
+
+Two things get worse with longer captures. Decode cost scales linearly, about
+2.7x the listen time, so 32 s of signal costs 85 s to decode. And the LNB drifts
+at roughly 4.5 Hz/s, so a long capture averages over a moving target: across the
+runs above the median walked from −105.77 to −106.57 kHz purely with elapsed
+time.
+
+Hence the 2 s default: ten periods, comfortable margin, and the same numbers 32 s
+gives for a twelfth of the decode time.
+
+### Fixed dwell against jittered
+
+An earlier version of the table above carried a `jitter 5 ms` row whose figures
+were byte-identical to the fixed row beside it — the same sd to the Hertz and
+the same comb offset to three decimals, while disagreeing on sharpness. Two
+captures with different dwell patterns cannot legitimately agree like that, so
+the row was withdrawn and the comparison rerun properly with the shipped
+decoder, 8 s captures at the recommended defaults:
+
+| | comb sharpness | epoch sigma | point-to-point sd | median error |
+|---|---:|---:|---:|---:|
+| **`JITTER=0`** (fixed) | 144× | **20.3** | **57 Hz** | −106.001 kHz |
+| `JITTER=1` | 151× | 14.4 | 60 Hz | −106.331 kHz |
+
+Fixed dwell is not merely no worse, it is **better**, and for a structural
+reason: jitter stretches one period from 200 ms to 376.8 ms, so the epoch search
+covers a longer, less regular pattern and its peak stands less clearly above the
+background — 14.4 sigma against 20.3. Comb sharpness is unaffected, since that
+step never looks at timing.
+
+Nothing is encoded in dwell, so there is nothing to buy by varying it. `--jitter`
+remains available and still decodes 20/20; the default is 0.
+
+Two things fall out of the dwell table:
+
+- **Precision tracks dwell**, because dwell is integration time. 2 → 10 ms
+  cuts the spread by 4×. Ten milliseconds is the recommended default.
+- **Jitter buys nothing measurable.** Fixed dwell is therefore preferred: it is
+  simpler, and it makes epoch alignment a uniform grid search.
+
+### Why it beats duration coding
+
+- **Identity comes from the seed, not from a measured duration.** Estimating a
+  burst length was the fragile step: it needs hysteresis, gap merging and
+  tolerance, and it collapses outright when adjacent points share the capture
+  band — which, for a span narrow enough to hear at one tuning, they always do.
+- **Random order decorrelates frequency from time.** A monotonic ladder steps
+  frequency in lockstep with time, so oscillator drift lands squarely on the
+  frequency-dependent term being measured. Randomising the order makes drift
+  orthogonal to it rather than confounded with it.
+- **A pseudorandom pattern autocorrelates sharply**, so the epoch search has one
+  unmistakable winner. A monotonic ramp correlates broadly and aligns poorly.
+- **It is far faster.** A cycle is 200 ms at the recommended 10 ms dwell (100 ms
+  at 5 ms) against 4.2 s for the equivalent ladder, and none of it is spent
+  muted. An 8 s capture holds 40 complete cycles instead of not quite two.
+
+### Recommended defaults
+
+| Setting | Value | Why |
+|---|---|---|
+| dwell | fixed 10 ms | precision goes as dwell^1.5; 0.038 Hz sd at 10 dB |
+| points | 20 | 20/20 recovered; 40 also works |
+| span | 11.000000 → 11.001710 GHz | 1.71 MHz, 90 kHz spacing |
+| seed | `0xC0FFEE` | the entire agreement between the two ends |
+| cycles | 300 | 60 s of transmit, so the receiver can be started after it |
+| receiver | 2.5 MS/s, 512-sample frames | ~2 MHz usable, 49 frames per dwell |
+| capture | 8 s | 40 cycles |
+
+The span must fit the receiver's instantaneous bandwidth so that one tuning
+hears every point. `sdr_listen.sh` tunes to (midpoint of span) − LO_nominal −
+LO_error_estimate; with a 9.75 GHz LNB and its measured ≈94 kHz LO error that
+puts the comb at about 1250.8 MHz, where the total offset seen is about
+−106 kHz.
+
+Override either end from the environment — but override **both**:
+
+```bash
+POINTS=40 HOP_MS=5 ./adf5355_rf_hop.sh
+POINTS=40 HOP_MS=5 SECONDS_LISTEN=20 ./sdr_listen.sh
+```
+
+### How the decoder works
+
+`tools/hop_decode.py` captures from the Pluto (or reads a capture off disk) and
+runs five steps:
+
+1. **Frame** the capture into blocks well shorter than one dwell, subtract each
+   frame's mean to kill the receiver's DC spur, window, and FFT.
+2. **Find the comb.** Every point shares one unknown offset — the LNB's LO error
+   plus the receiver's clock error are common to all of them — so the comb moves
+   as one rigid object. Slide it over the time-averaged spectrum and keep the
+   offset with the most energy in the expected bins.
+3. **Build a per-point envelope**: for each point, the largest magnitude inside a
+   narrow slot around its offset-corrected expected frequency, per frame. This
+   is the step that makes the whole thing work. A single broadband envelope
+   merges adjacent points into one continuous excursion and tells you nothing.
+4. **Align the epoch.** Regenerate the schedule from the seed and slide it over
+   **one period only** — the pattern repeats every `--period-cycles`
+   permutations — scoring each shift by the mean envelope of the point the
+   schedule expects in each frame. That bounds the search at 200 ms instead of
+   the length of the run.
+5. **Measure.** Per point, fit each whole dwell coherently and combine the
+   dwells. The frequency error is measured minus nominal IF. This step is
+   selectable and is the subject of the next section.
+
+The schedule itself is imported from `adf5355.hopper` — the same generator the
+transmitter runs — so the two ends cannot drift apart.
+
+### Measuring each point: the estimator
+
+Steps 1–4 find and label the signal, and they are good at it. They are a poor
+way to measure a *frequency*, and the reason is not noise.
+
+`--estimator peak` is the original: the interpolated FFT peak of each frame,
+then the median over the frames the schedule assigns to that point. Its error is
+**bias, not noise** — see above — so it is flat at ~58 Hz whatever the SNR,
+whatever the dwell, and however long you listen:
+
+| per-sample SNR | −10 dB | 0 dB | 10 dB | 20 dB | 30 dB | 40 dB |
+|---|---:|---:|---:|---:|---:|---:|
+| `peak`, one dwell | 98.2 | 65.9 | 59.3 | 57.8 | 58.8 | 58.7 |
+| `ml`, one dwell | **0.82** | **0.24** | **0.087** | **0.026** | **0.0079** | **0.0023** |
+| Cramér–Rao bound | 0.78 | 0.25 | 0.078 | 0.025 | 0.0078 | 0.0025 |
+
+*rms error in Hz on one 10 ms dwell, 200 trials per cell.*
+
+`--estimator ml` (the default) does the only thing that helps: it stops
+estimating frequency from a framed spectrogram. Within one dwell the transmitter
+emits a clean CW tone of known start and length, so the whole dwell is used at
+once —
+
+1. mix the dwell down by the coarse frequency the comb search already
+   established, so the residual sits near DC;
+2. boxcar-decimate by 32. A boxcar is linear phase, so it shifts the time origin
+   and nothing else and cannot bias a frequency estimate; it costs no Fisher
+   information and makes the fit 32× cheaper;
+3. find the periodogram maximum, which for one tone in white Gaussian noise *is*
+   the maximum-likelihood estimate, and Newton onto it exactly.
+
+Measured at **1.010× the Cramér–Rao bound** from −5 dB to 20 dB per sample.
+There is nothing material left on the table: the bound is what no estimator can
+beat, and this one is within one percent of it.
+
+Other estimators are selectable for comparison — `zeropad` (indistinguishable
+from `ml`), `jacobsen` (1.5× the bound), `kay` and `phase-slope` (equal to `ml`
+above 0 dB, and they collapse below it, which is why neither is the default).
+
+**Guards matter.** The synthesiser retunes *into* the start of each dwell, so
+the first millisecond or so is a settling chirp rather than a tone, and a
+coherent fit over the whole dwell has no median to spit that out for it.
+`--guard-start-ms` (default 1.5) and `--guard-end-ms` (default 0.2) trim the
+head and tail; precision goes as the 3/2 power of what is left, so the trim is
+cheap. The run does not ask you to take the guard on trust — it fits each half
+of every dwell separately and reports what they disagree by, which is zero for a
+clean tone and grows with anything that is not one:
+
+| head guard | 0 ms | 0.5 ms | 1.5 ms | 3.0 ms |
+|---|---:|---:|---:|---:|
+| residual bias | +7.71 Hz | +6.39 Hz | +0.71 Hz | +0.02 Hz |
+| reported half-split | +38.8 Hz | +24.1 Hz | +2.54 Hz | +0.09 Hz |
+
+*against a 1.2 ms, 2 kHz settling chirp. Raise the guard until the half-split
+comes back to zero.*
+
+**The LNB's drift is fitted out.** The LO walks about 4.5 Hz/s, and because the
+schedule repeats, each point is always visited at the same phase of the period —
+so the drift lands on each point as a *fixed* offset that a longer capture does
+not average away. One drift rate, common to every point, is fitted across every
+visit at once and removed; `--no-drift-fit` turns it off. On a 4 s capture with
+4.5 Hz/s injected, the fit recovers 4.499 Hz/s and takes the spread from
+0.244 Hz to 0.0069 Hz.
+
+**Visits are combined incoherently, and that is not a compromise.** Each point
+is visited many times per capture, and the visits are averaged by inverse
+variance — a mean, not a median, which is 1.28× tighter for exactly the textbook
+reason. Combining them *coherently* would be worth vastly more: precision would
+grow with the 3/2 power of the whole capture span instead of the square root of
+the visit count, measured here at 150× better. It is not available:
+
+| transmitter phase | LNB drift | measured coherence | random-phase null | verdict |
+|---|---:|---:|---:|---|
+| free-running | 0 Hz/s | 0.999 | 0.278 | coherent — 0.00004 Hz |
+| relocks each visit | 0 Hz/s | 0.191 | 0.278 | **not coherent** |
+| free-running | 4.5 Hz/s | 0.144 | 0.278 | **not coherent** |
+
+A synthesiser that retunes away and relocks has no memory of where its phase
+was, which is the second row. And the third row is the one that closes the
+door: phase is the integral of frequency, so a drifting LO puts a *quadratic*
+phase across the capture that no single common frequency can absorb — even a
+perfectly coherent transmitter is not coherent through this LNB. Coherent
+combination is unavailable twice over.
+
+**Every one of those numbers was measured on synthetic signals, and no operator
+has to take them on trust.** The visit weights are inverse variances taken
+straight from the Cramér–Rao bound, so the bound's prediction for the actual SNR
+and dwell of the actual capture falls out for free, and each run prints what it
+really achieved beside it:
+
+```
+  vs the bound : 0.97x the Cramer-Rao limit for this SNR and dwell
+```
+
+1.0 means there is nothing left on the table. A large number means the visits of
+one point disagree by more than noise can explain — something unmodelled is
+moving, the quoted precision is not the accuracy, and the run says so and fails.
+Injecting an unfitted 4.5 Hz/s drift reads **166×** and warns; fitting it out
+reads **1.02×** and does not. The ratio is withheld below eight visits per
+point, where a standard error is itself too uncertain to mean anything, and the
+standard errors are corrected for the small-sample bias of a sample deviation
+(*c₄*) — without that correction five visits read 0.7× and would look like
+beating a bound that cannot be beaten.
+
+`--combine coherent` implements it anyway, because a claim that a technique does
+not apply is worth nothing unless the same code can be shown working when it
+does. It is gated on the measured coherence clearing a random-phase null
+computed from the same magnitudes at the same times, and the gate is decided
+once over all twenty points rather than per point — a per-point test lets one
+point in twenty through by chance, and one point combined coherently when it
+should not be lands a whole hertz out and ruins the spread the other nineteen
+just earned. On incoherent input it does not degrade gracefully; it locks onto
+the wrong lobe of the 1/period comb and returns a confident answer 30–90× worse
+than the average it replaced. Hence the gate, and hence the default.
+
+### Reading the confidence figures
+
+A confident wrong answer is the failure that matters, so every run prints two
+numbers and shouts if either is poor:
+
+```
+  comb offset  : -106.421 kHz (sharpness 9867x, floor 8x)
+  epoch        : 37.17 ms of a 200.0 ms period (sigma 1104.8, floor 10)
+  points       : 20/20 recovered from 4882 frames (1.00 s, slot +/-27.0 kHz)
+```
+
+- **comb sharpness** — peak over median of the offset search. Under 8× means the
+  comb was not found and the offset is not a measurement. Pure noise scores
+  under 2×; the bench runs scored 37–422×.
+- **epoch sigma** — how far the winning alignment stands above the background of
+  the search. Under 10 means the alignment is ambiguous and *every point may be
+  mislabelled*. Decoding with the wrong seed scores under 5.
+- **points recovered** — anything short of all of them says the span does not fit
+  the passband, or the two ends disagree about the schedule.
+
+Anything the run flags — either floor missed, a point short, a frame longer than
+a dwell, a span wider than the passband — prints a `CONFIDENCE IS POOR` banner
+*and* sets a non-zero exit status. The banner and the exit status are the same
+condition by construction, so a scripted run cannot record a number the report
+has just told a human not to use.
+
+### Verifying it with no hardware at all
+
+```bash
+python3 tools/hop_decode.py --self-test
+```
+
+synthesises the capture a perfect receiver would have taken — the real schedule,
+a planted comb offset and a planted epoch — and decodes it, so the whole chain
+can be exercised on a machine with no radio and nothing transmitting. The test
+suite does the same thing and asserts the planted numbers come back.
+
+A capture can also be kept and re-analysed later, which is the cheapest way to
+try decoder settings against real data:
+
+```bash
+./sdr_listen.sh --capture-out run.iq          # capture and decode
+python3 tools/hop_decode.py --capture run.iq --frame 1024 --json
+```
+
+### What a narrow hop cannot do
+
+The receiver's clock error is the *slope* of Δf against frequency, so separating
+it from the LNB's LO error needs frequency span. Across 1.71 MHz a 9 ppm clock
+error moves Δf by about 15 Hz. One hop run therefore measures the total offset
+at one frequency very precisely, but cannot split it into its two causes.
+
+That is what the next section is for: the same seeded schedule, spread over
+clusters more than a gigahertz apart in IF, fitted together.
+See [The frequency lever arm](#the-frequency-lever-arm-separating-d_rx-from-d_lnb).
+
+---
+
+## The frequency lever arm: separating d_rx from d_lnb
+
+A single narrow cluster measures the receiver's total offset superbly and
+**cannot take it apart**. Writing `d` for a fractional frequency error, what a
+capture sees is
+
+```
+Δf(f_IF) = -d_rx · f_IF  -  d_lnb · f_LO_nom  -  b(rx_lo)  -  drift(t)
+           \___________/   \_______________/   \________/   \________/
+            scales with     constant in Hz      tuning       LNB warming
+            the IF                              bias         up
+```
+
+Across one 720 kHz cluster the first term moves by 6 Hz for a 9 ppm clock. The
+number that comes out is therefore precise and is a *blend*. Splitting it needs
+frequency span, and the LNB low band supplies it: RF 10.7–11.9 GHz is IF
+0.95–2.15 GHz, so between the outermost clusters the first term moves by
+**10.7 kHz**. That is the lever arm, and everything below exists to use it
+without letting the retuning it requires eat the answer.
+
+```bash
+./adf5355_rf_lever.sh                  # transmit: hop over every cluster, forever
+OPEN_RADIO=1 ./sdr_lever.sh            # receive: visit each cluster, many times, fit
+tools/lever_fit.py lever-run.jsonl     # re-fit a saved run without re-capturing
+```
+
+### The transmitted schedule
+
+One seeded schedule covers every cluster, and **a receiver tuned to any one of
+them sees a complete, decodable pattern for that cluster and needs none of the
+others**. Four properties make that work.
+
+| | |
+|---|---|
+| **Rounds** | Every cluster is visited once per round, in an order redrawn each round. No cluster is starved, and none sits at a fixed phase of the period — which is what would let the LNB's drift correlate with which cluster is being heard. |
+| **Blocks** | Dwells come in blocks of consecutive same-cluster points, so only the first dwell of a block changes VCO band. Within a cluster the span is under a megahertz, well inside one band, so the rest hop with dividers alone exactly as the single-cluster schedule always has. |
+| **A longer dwell where the band changes** | That first dwell is `--band-extra-ms` longer, and the receiver skips exactly the extra. Every measured window is then the same length whether or not the band moved, no point is ever lost, and "was the allowance enough?" stops being a judgement call — the half-split check answers it. |
+| **A Golomb ruler, not a grid** | The points inside a cluster are **not** evenly spaced. See below; this one is not cosmetic. |
+
+The period is one whole cycle — every cluster's every point, once. With C
+clusters a receiver hears its own cluster 1/C of the time; that duty factor is
+the price of the lever arm and is unavoidable with one transmitter. The fix is
+simply to listen C times as long.
+
+### Why the points are not evenly spaced
+
+Slide a uniformly spaced comb of P points by one spacing and P−1 of its points
+land on neighbours. The receiver's comb search then has a rival peak scoring
+(P−1)/P of the truth, one whole spacing away — and taking that rival
+**mislabels every point and returns a confident answer wrong by a spacing**.
+This is not hypothetical: it happened, on synthetic captures, to a four-point
+cluster whose alias scored 3/4.
+
+The points therefore sit on an optimal **Golomb ruler** scaled to the cluster
+span. Every pairwise difference is distinct, so no shift can realign more than
+one pair and the best alias scores 1/P. The decoder reports the measured
+margin over the nearest rival peak beside the old peak-over-median sharpness,
+and judges it against what the frequency plan itself allows — a uniform comb is
+not condemned for an ambiguity it cannot help, and an aperiodic one is not
+excused for losing a margin it should have had.
+
+The price is that a Golomb ruler of P marks is longer than P−1 units, so for a
+fixed span the closest pair shrinks as the ruler's length. That is what bounds
+the useful points per cluster: at 720 kHz of span, **six points leave 42 kHz**
+between the closest pair, while twelve would leave 8 kHz — under two FFT bins,
+too close to separate. More points is not the route to more precision here
+anyway: the total time on air per cluster is what sets it, and splitting that
+among more points only makes each one shorter.
+
+### The tuning bias is the whole problem
+
+The same unmoving tone, measured from eight different `rx_lo` settings, spanned
+**362 Hz** on this hardware — about 127 Hz sd. That bias is additive and
+constant across one capture: it cancels out of anything measured *inside* a
+capture, and it does not cancel at all between captures at different clusters,
+which is exactly the contrast the lever arm is made of. Left alone it would put
+√2 × 127 / 1.2 GHz ≈ **0.15 ppm** on d_rx — only twice better than the ±0.3 ppm
+the single-cluster method already quotes, and the whole exercise would be
+pointless.
+
+Four things are done about it, in order of importance.
+
+1. **Dither the tuning.** Every capture is taken at an `rx_lo` drawn at random
+   from a ±450 kHz window. Whether the bias is a deterministic function of the
+   requested LO or a fresh draw on every retune — and that cannot be told from
+   outside — dithering makes it an independent draw per capture, so N captures
+   of one cluster average it down as √N. **Without the dither, retuning to the
+   same number reproduces the same bias and more captures buy nothing.**
+2. **Many short captures rather than few long ones.** The bias per capture does
+   not care how long the capture is, and it is about 8000× larger than the
+   estimator's noise (127 Hz against 0.015 Hz measured on a 3 s synthetic
+   capture). Precision tracks the **number** of captures, not the total
+   listening time. Three seconds is enough to decode; longer is spent buying
+   precision that is already free.
+3. **Measure it rather than assume it.** The scatter of one cluster's captures
+   about the fit *is* the tuning bias, so its size is estimated from the run as
+   a variance component and fed into the answer. And the **variogram** — that
+   scatter as a function of how far apart the two tunings were — says whether
+   the dither is really decorrelating it. A flat variogram is the evidence that
+   the √N is being earned; one that rises with separation means nearby tunings
+   agree, the bias is smooth across the dither window, and the run says so.
+4. **Resample, do not trust a covariance.** Every uncertainty quoted comes from
+   refitting resampled data.
+
+### Drift, and why d_rx and d_lnb are fitted differently
+
+The LNB LO walks about 4.5 Hz/s, so over a ten-minute run it moves by
+kilohertz — far more than the tuning bias. Captures are therefore taken in
+**sweeps**: one capture of every cluster, in a fresh order each time.
+
+* **d_rx** is fitted with a **free offset per sweep**. That absorbs the LNB's LO
+  error, its drift, and any other purely time-dependent common term, *of any
+  shape*, exactly. d_rx survives because it is the only term that varies with
+  IF and every sweep holds every cluster. Injecting a 3 kHz exponential warm-up
+  — a curve no polynomial follows — leaves under 0.01 ppm on d_rx.
+* A **within-sweep drift slope** is fitted as well. A sweep takes about a
+  minute and 4.5 Hz/s is 200 Hz across one, which a free constant does not
+  touch; it aliases onto whichever cluster was visited early against late. The
+  visit order is a **cyclic Latin square** so that imbalance is zero by
+  construction, and the slope removes whatever is left. Both defences are
+  aimed at the same 0.02 ppm, which is the size of the whole answer. Without
+  them a 120-run study showed a real +0.008 ppm bias; with them, +0.001 ppm.
+* **d_lnb** cannot be fitted that way — it *is* a constant in Hz, so free
+  per-sweep offsets would swallow it. It is fitted instead against an explicit
+  smooth drift in time, and its uncertainty is dominated by that model choice.
+  It is also only meaningful at an instant, since the thing being measured is
+  moving at 4.5 Hz/s; the report says which instant and at what rate.
+
+### The narrow lever, as an independent witness
+
+Each capture also yields a slope across its own cluster — 720 kHz instead of
+1.2 GHz. A thousand times less lever arm, but **no tuning bias at all** (a
+constant offset cancels exactly out of a slope), no dependence on the drift
+model, and on a 3 s synthetic capture it measures d_rx to ±0.01–0.07 ppm on its
+own. It is reported and compared, and by default **not folded into the answer**.
+
+That is a considered position. The narrow lever is far tighter than the wide
+one, so combining would hand it the answer; and the only evidence it is
+unbiased is that the two agree — evidence good to about the wide lever's own
+precision. Quoting an uncertainty smaller than that would be quoting an
+assumption. `--narrow combine` does it anyway for anyone who accepts that
+nothing but the sample clock can tilt a slope measured inside one capture;
+`--narrow off` ignores it. What the default buys is a check that can fail: if
+something in the receiver depends on baseband frequency, or the dither is not
+randomising the tuning bias, the two levers disagree and the run says so.
+
+### Uncertainty, and what it is dominated by
+
+Nothing here quotes a covariance standard error as the answer. The decoder's
+own standard errors are the *estimator's* — hundredths of a hertz — while the
+scatter that governs the answer is the tuning bias at a hundred hertz, which is
+not in that number at all. A covariance built on the decoder's errors alone
+understates the answer's uncertainty by **more than tenfold**, and there is a
+test that asserts exactly that.
+
+Be precise about which covariance that is, though, because the report prints
+another one beside it. `fit_wide` estimates the tuning bias as a variance
+component from the run's own residuals and puts it in the weights, and *that*
+covariance agrees with the resample to a few percent — measured at 0.0284 ppm
+against a 0.0285 ppm resample over 200 synthetic 25-sweep runs. So the resample
+is not rescuing the answer from a broken covariance; it is quoted because it is
+model-free, and it is what catches the case where the variance component itself
+is wrong. The `covariance` column in the report is there so the gap, when there
+is one, is visible.
+
+Instead: a **bootstrap over sweeps** and a **leave-one-sweep-out jackknife**,
+with the larger of the two quoted. The sweep is the resampling unit because it
+is the exchangeable one — every sweep holds every cluster, its captures share a
+moment in the LNB's warm-up and nothing else, and each carries its own
+independent draw of the tuning bias.
+
+**Expected tolerance.** With σ_b the tuning bias, S sweeps and clusters at IFs
+x_c,
+
+```
+σ(d_rx) = σ_b / sqrt( S · Σ_c (x_c − x̄)² )
+```
+
+which for 127 Hz, four clusters evenly spread over 0.95–2.15 GHz, is
+**0.142 / √S ppm**:
+
+| sweeps | captures | run time | σ(d_rx) predicted | measured | quoted | 95% covered | σ(d_lnb) |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 10 | 40 | ~7 min | 0.045 ppm | 0.041 ppm | 0.046 | 95% | 74 Hz on 9.75 GHz |
+| 25 | 100 | ~17 min | 0.028 ppm | 0.028 ppm | 0.029 | 93% | 49 Hz |
+| 50 | 200 | ~33 min | 0.020 ppm | 0.020 ppm | 0.020 | 91% | 35 Hz |
+
+"Measured" is the true scatter of the answer about the injected truth, over
+independently synthesised runs — 520 at 25 sweeps, 120 at each of the others,
+generated from the forward model rather than from this file's own synthesiser.
+"Quoted" is the σ the resample reported on the same runs. They agree to about
+5%, and the nominal 95% interval covered 91–95%. So **treat the quoted 1σ as
+good to about 10%, and the 95% interval as nearer 93%**. Below 8 sweeps a
+resample over sweeps has too few blocks to be believed: at 5 sweeps the d_rx
+interval covered 86%, d_lnb's quoted σ was 4.5× its true scatter, and the
+variogram raised a false alarm on 13 runs in 100 against 1 in 100 at eight. At
+eight sweeps everything is back in line (93% covered, σ within 3%), which is
+why `MIN_SWEEPS` is 8 and why the run refuses to be trusted below it.
+
+The run times are wall clock, not capture time: on a Pi the decode of one 3 s
+capture takes about 5.8 s, so a capture costs about 10 s and 100 of them cost
+17 minutes. The transmitter's `CYCLES` has to cover *that*, which is why its
+default is 16000 (75 minutes) and not something derived from the 3.
+
+Against the ±0.3 ppm the single-cluster method quotes today, a fifteen-minute
+run is **about eleven times tighter**, and the improvement keeps going as √N
+until something in the "not in the budget" list below becomes the limit.
+
+**The dominant term is the receiver's tuning bias, by a very long way.** In a
+25-sweep run it contributes 0.028 ppm, against 0.0001 ppm from the frequency
+estimator (0.02–0.08 Hz per capture, measured end to end from synthetic I/Q at
+10 dB, over the same lever), 0.0000001 ppm from the
+ADF5355's own frequency plan (worst point 0.43 mHz from nominal across the
+whole lever arm), and 0.0001 ppm from the exact-versus-linearised inversion,
+which is done exactly anyway. Everything except the tuning bias is two to
+seven orders of magnitude down, and nothing else is within a factor of 200.
+
+What is *not* in that budget, because no resample can see it:
+
+* **A tuning bias that TRENDS with rx_lo across the lever.** This is the one
+  that matters most, and it is worth being blunt about. The dither randomises
+  the bias *locally*, over ±450 kHz; it does nothing about a component that
+  varies smoothly across the 1.2 GHz between the outermost clusters. Such a
+  component lands on d_rx one for one: a slope of k Hz per Hz of tuning shifts
+  d_rx by exactly k. Injected into a 25-sweep run, k = 0.1 ppm moved the answer
+  by 0.072 ppm and the two-lever comparison read only 2.3σ — it passed. The
+  check bites at about **0.15 ppm**. So the *precision* of a 25-sweep run is
+  0.028 ppm and its *accuracy* against this one failure is certified only to
+  about 0.15 ppm at 3σ, or 0.05 ppm at 1σ. If the 362 Hz of tuning bias this
+  hardware showed across eight tunings is mostly a trend rather than a scatter,
+  it is worth up to 0.3 ppm and the two levers will disagree loudly — which is
+  why the `d_rx by lever` lines are the first thing to read in the report, not
+  the last.
+* **A response that curves with frequency.** An LNB band edge, a filter, a
+  reflection: a bias, not a scatter. The per-cluster residuals are printed and a
+  χ² on them fails the run — measured sensitivity, at 25 sweeps: a 300 Hz
+  offset on one cluster is caught, 100 Hz is not (and 100 Hz is worth about
+  0.02 ppm, which is inside the noise anyway).
+* **A tuning bias that the dither does not randomise.** The variogram is the
+  check, and it fails the run too — it caught 3 of 4 synthetic runs whose bias
+  was smooth across the dither window.
+* **The Pluto's own reference moving during the run.** The fit assumes one
+  d_rx; the split-half comparison is the check. "Well outside" means
+  `SPLIT_HALF_SIGMA * SPLIT_HALF_SCALE` times the quoted σ, and the scale is
+  **2**, not √2: each half is fitted from half the sweeps so carries √2 times
+  the whole run's σ, and the two are independent, so their difference scatters
+  by 2× it. Measured directly, 1.97×. Scaling by √2 makes a nominal 3σ test
+  into a 2.1σ one and condemns roughly one blameless run in thirty. Let the
+  radio reach thermal steady state first.
+* **d_tx.** Three clocks are involved and only two can be separated. Since
+  f_RF = f_IF + f_LO, a transmitter reference error splits into one piece
+  scaling with f_IF and one that does not — exactly the two slots d_rx and
+  d_lnb occupy. **What is measured is (d_rx − d_tx) and (d_lnb − d_tx):
+  everything is referred to the transmitter's 125 MHz reference.** That has to
+  be said out loud, because "the SDR's clock error" only means something
+  against something else.
+
+### Running it on the bench
+
+```bash
+# 1. Transmit. Leave it running for the whole receiver run.
+#    CLOSED PATH ONLY -- coax into an attenuator and a load. No antenna.
+./adf5355_rf_lever.sh
+
+# 2. Sanity-check one cluster before committing to a long run.
+#    This is one capture, decoded and printed in full.
+tools/hop_decode.py --clusters 4 --cluster 0 --seconds 3 --capture-out /tmp/c0.iq
+tools/hop_decode.py --clusters 4 --cluster 3 --seconds 3
+
+# 3. The run itself.
+OPEN_RADIO=1 SWEEPS=25 OUT=lever-run.jsonl ./sdr_lever.sh
+
+# 4. Re-fit later, as often as you like, without re-capturing.
+tools/lever_fit.py lever-run.jsonl --json
+tools/lever_fit.py lever-run.jsonl --narrow combine   # see what the assumption buys
+```
+
+Before step 3, check step 2's report for three things. **`margin over the
+nearest rival`** measured 4.3–4.7× for six points on synthetic captures at
+10 dB, against a geometric ceiling of 6× — near 1× means the comb search
+cannot tell the right comb from a shifted copy, and the decoder fails the
+capture for it. **`dwell halves`** should be zero within its own error bar; if it
+is not, raise `BAND_EXTRA_MS` until it is — **at both ends**, because it is a
+schedule parameter and the two must agree — since that is the VCO band search
+leaking into the measurement. Do *not* reach for `--drop-band-change` as the
+fix: the schedule repeats, so whichever point leads a block leads it every
+period, and dropping those dwells drops those points outright (2 of 6 at the
+defaults) and disowns the capture. It is a diagnostic — decode the same capture
+both ways and see whether the answer moves — not a remedy. **`vs the bound`**
+should be near 1×; far above means something unmodelled is moving and the
+precision is not the accuracy.
+
+And read **`d_rx by lever`** on the final report before anything else. It is the
+only check on a receiver bias that trends with rx_lo across the lever arm, which
+is the one error that lands on d_rx one for one and that no amount of dithering,
+sweeping or resampling can remove. The report now prints what a pass is worth in
+ppm, and that number — not the resample — is the honest accuracy.
+
+Let the Pluto reach thermal steady state before starting. The fit assumes one
+d_rx for the whole run and the split-half check will say so if that is wrong,
+but a run that has to be thrown away is an expensive way to find out.
+
+### The transmitter runs from Python, not from `tools/hop_tx`
+
+The C transmitter's plan format carries one fixed dwell and one register triple
+per point, written with no VCO band search. A cluster schedule needs neither of
+those: band-changing dwells are longer than the rest, and they need a real
+retune with the band search or the loop simply does not lock across a
+1.2 GHz step. So `adf5355 hop-lever` drives this one, from Python, with the
+collector paused for the duration.
+
+That is comfortable here. The hop rate is 100/s against the 1600/s the C path
+was built for, the measured scheduling jitter with the collector off is under
+4 µs, and each cycle needs only `clusters × points / block` band searches — a
+tenth of the hops. If the C transmitter is ever wanted for this, it needs a
+per-hop dwell field and an autocal register set, and `emit_hop_plan.py` needs
+to emit both.
+
+### Verifying the whole chain with no hardware
+
+Every layer has an offline path, and they are the same code the radio uses.
+
+```bash
+tools/lever_fit.py --self-test          # synthesise a run, recover d_rx and d_lnb
+tools/lever_run.py                      # print the visit plan, open nothing
+tools/lever_run.py --synthetic --sweeps 12 --out /tmp/fake.jsonl --fit
+SYNTHETIC=1 ./sdr_lever.sh              # the same, through the operator script
+```
+
+`--synthetic` builds every capture in memory from an injected d_rx, d_lnb,
+drift and per-capture tuning bias, then runs the identical decode and fit. There
+is no separate offline code path to rot.
+
+---
+
+## The duration-coded ladder (superseded)
+
+> **Superseded by [seeded frequency hopping](#seeded-frequency-hopping-recommended).**
+> On the bench the ladder never identified more than 1 burst in 95, because
+> identity depends on *measuring* a burst length and adjacent rungs inside one
+> capture band merge into a single continuous excursion. Hopping identified
+> 100% of points in every configuration tried. The ladder is kept because it is
+> the pattern in the original guide, because its wide-span form is still the way
+> to separate a receiver's clock error from the LNB's LO error, and because its
+> independent measurement of −105.9 kHz is what cross-checks the hop decoder.
+
+```bash
+adf5355 ladder --enable-rf                            # the guide's pattern
+adf5355 ladder --start-ghz 8 --stop-ghz 9 --steps 4 --total-s 6
+adf5355 ladder --loops 3 --enable-rf
+```
+
+N carriers are stepped evenly across a range. **Rung *n* transmits for *n*·u
+seconds, then stays quiet for *n*·u seconds**, where the unit time follows from
+the requested total:
+
+```
+    u = total_s / (N · (N + 1))
+```
+
+because the windows sum to `2·u·(1 + 2 + … + N) = u·N·(N+1)`.
+
+Every rung therefore has a **distinct burst length**, and the length of a burst
+alone identifies which rung produced it — and so its frequency. No handshake,
+no shared clock, no agreement on a start time is required between transmitter
+and receiver.
+
+Rung *n* occupies, measured from the start of the coded interval:
+
+```
+    ON   from  u·n·(n−1)   to  u·n²
+    OFF  from  u·n²        to  u·n·(n+1)
+    burst length = u·n
+    frequency    = f_start + (f_stop − f_start) · (n−1)/(N−1)
+```
+
+The defaults reproduce `raspberry_pi_adf5355_ku_ladder_guide.pdf` exactly —
+nine carriers, 10.700 to 12.700 GHz in 250 MHz steps, 18.000 s total, u = 0.200 s:
+
+| rung | frequency | burst | ON window (s) | OFF until |
+|---:|---:|---:|---:|---:|
+| 1 | 10.700 GHz | 0.2 s | 0.00 – 0.20 | 0.40 |
+| 2 | 10.950 GHz | 0.4 s | 0.40 – 0.80 | 1.20 |
+| 3 | 11.200 GHz | 0.6 s | 1.20 – 1.80 | 2.40 |
+| 4 | 11.450 GHz | 0.8 s | 2.40 – 3.20 | 4.00 |
+| 5 | 11.700 GHz | 1.0 s | 4.00 – 5.00 | 6.00 |
+| 6 | 11.950 GHz | 1.2 s | 6.00 – 7.20 | 8.40 |
+| 7 | 12.200 GHz | 1.4 s | 8.40 – 9.80 | 11.20 |
+| 8 | 12.450 GHz | 1.6 s | 11.20 – 12.80 | 14.40 |
+| 9 | 12.700 GHz | 1.8 s | 14.40 – 16.20 | 18.00 |
+
+A 1.4 s burst is rung 7, and therefore 12.200 GHz.
+
+`ladder` defaults to `--channel B`, since 10.7–12.7 GHz is out of RFoutA's
+range. Each rung's frequency is programmed during the *previous* rung's OFF
+window, so retuning never eats into a coded ON window and the burst lengths stay
+true to the schedule.
+
+---
+
+### Ready-made scripts
+
+The two runner scripts — `adf5355_rf_hop.sh` and `sdr_listen.sh` — drive the
+**hop**, not the ladder; see
+[Seeded frequency hopping](#seeded-frequency-hopping-recommended).
+There is no runner script for the ladder any more. Run it straight from the CLI:
+
+```bash
+adf5355 ladder --start-ghz 11.0 --stop-ghz 11.00171 \
+               --steps 20 --total-s 4.2 --loops 6 --enable-rf
+```
+
+### Fast, narrow ladders: the whole cycle in one capture
+
+The Ku-band default steps 250 MHz between rungs, so a receiver has to retune for
+each one. If instead the entire span fits inside the receiver's instantaneous
+bandwidth, the whole ladder is heard at a **single tuning**, which is both far
+more convenient and better measurement practice:
+
+- every rung shares one `rx_lo`, so the receiver's tuning-dependent bias becomes
+  common mode instead of differing rung to rung;
+- many complete cycles fit in one listen, so there is far more data to average;
+- no retuning gaps, so nothing is missed between rungs.
+
+The synthesiser is much faster than the default suggests. Measured on a Pi 4
+over 1 MHz SPI: a full retune is **0.84 ms** and keying the output is
+**0.075 ms**, so the per-rung control cost is about **1 ms**. `u = 10 ms` leaves
+tenfold headroom, and with busy-wait deadlines the realised bursts hold to
+**6 µs median, 24 µs worst** — 0.06% of a unit.
+
+A ladder sized for a receiver listening at 2.5 MS/s (about 2 MHz usable):
+
+```bash
+adf5355 ladder --start-ghz 11.0 --stop-ghz 11.00171 \
+               --steps 20 --total-s 4.2 \
+               --loops 6 --power 0 --enable-rf
+```
+
+20 rungs, 90 kHz apart, spanning 1.71 MHz; `u = 10 ms`, so bursts run 10 ms to
+200 ms and a full cycle takes 4.2 s. A 20 second capture therefore contains
+nearly five complete cycles — around 95 individually identified bursts from one
+tuning.
+
+`ladder` refuses a schedule whose shortest burst approaches the control
+overhead, since the emitted pattern would stop matching the published one and
+duration coding would break down:
+
+```
+$ adf5355 ladder --start-ghz 11.0 --stop-ghz 11.002 --steps 20 --total-s 0.4
+error: shortest burst 0.95 ms is under 4x the ~0.99 ms control overhead;
+       raise --total-s or lower --steps
+```
+
+**What a narrow ladder cannot do.** The receiver's clock error is the *slope* of
+Δf against frequency, so recovering it needs frequency span. Across 1.71 MHz a
+9 ppm clock error moves Δf by only about 15 Hz, well under the receiver's
+tuning-dependent systematic. A single narrow ladder therefore measures the total
+offset at one frequency very precisely, but cannot separate the receiver's clock
+error from the LNB's LO error.
+
+To get both, run the fast narrow ladder at several widely separated centres —
+say 10.7, 11.1 and 11.5 GHz — and capture 20 s at each. Every capture yields a
+precise local Δf, and the spread across centres restores the lever arm.
+
+## Running a calibration end to end
+
+> **Conducted path only.** This example is written for a closed bench setup: the
+> synthesiser reaches the LNB through coax and attenuation, inside shielding.
+> Do not radiate it, and do not put an antenna on either end. The frequencies
+> involved are satellite downlink allocations.
+>
+> Note also that an LNB front end expects roughly −100 dBm. Feeding one directly
+> from the synthesiser without heavy attenuation will saturate it and can damage
+> it, quite apart from the licensing question.
+
+A complete worked example against a PlutoSDR behind a 13 V (low band) universal
+LNB, whose nominal LO is 9.750 GHz.
+
+**Frequency plan.** Five rungs, 10.7 to 11.5 GHz in 200 MHz steps, one pass
+every 30 s, so `u = 30 / (5 x 6) = 1.0 s` and the bursts are 1, 2, 3, 4 and 5 s.
+Subtracting the LNB LO gives the IF each rung lands on:
+
+| rung | burst | RF | IF (RF − 9.75 GHz) |
+|---:|---:|---:|---:|
+| 1 | 1 s | 10.700 GHz | 950 MHz |
+| 2 | 2 s | 10.900 GHz | 1150 MHz |
+| 3 | 3 s | 11.100 GHz | 1350 MHz |
+| 4 | 4 s | 11.300 GHz | 1550 MHz |
+| 5 | 5 s | 11.500 GHz | 1750 MHz |
+
+Those IFs sit inside the LNB's low-band output passband (roughly 950–2150 MHz).
+13 V with no 22 kHz tone selects low band; high band would use a 10.6 GHz LO and
+move every rung.
+
+### 1. Transmit (this repository, on the Pi driving the ADF5355)
+
+Start the ladder first and leave it looping for the whole receive session. Twelve
+passes is 6 minutes, comfortably longer than five 40 s captures:
+
+```bash
+adf5355 ladder --start-ghz 10.7 --stop-ghz 11.5                --steps 5 --total-s 30                --loops 12 --power 0 --enable-rf
+```
+
+The receiver is never told when a rung keys. It recovers that from burst length.
+
+### 2. Receive and solve (pluto-plus-utils, on the host with the radio)
+
+One capture per rung, retuned to that rung's nominal IF. Each capture must be
+longer than one full pass plus the longest burst, so the rung is guaranteed to
+appear complete rather than clipped at an edge:
+
+```bash
+for IF in 950000000 1150000000 1350000000 1550000000 1750000000; do
+    uv run pluto radio settings set RADIO --frequency $IF
+    uv run pluto capture start RADIO --duration 40
+done
+```
+
+Then hand the artifact IDs to the calibrator, telling it the *published* ladder
+parameters — the same numbers used above:
+
+```bash
+uv run pluto calibrate freq-ladder ART_1 ART_2 ART_3 ART_4 ART_5     --rung-start-hz 10.7e9 --rung-stop-hz 11.5e9 --rung-count 5     --total-seconds 30 --lo-hz 9.75e9
+```
+
+It identifies each burst by duration, maps it back to that rung's frequency, and
+fits the receiver's clock error (slope) and the LNB's LO error (intercept). A
+single capture can be inspected on its own with
+`pluto analyze ARTIFACT_ID --analyzer freq_ladder`.
+
+### 3. Apply
+
+```
+    xo_new = xo_current x (1 + d_rx)
+```
+
+Re-run the calibration afterwards and confirm the fitted slope collapses toward
+zero — that also confirms the sign.
+
+### Choosing the parameters
+
+- **Span as wide as the LNB IF allows.** The slope is the receiver's clock error,
+  so its precision is roughly (measurement error) / (IF span). A 2 GHz span is
+  worth far more than a 200 MHz one.
+- **At least 3 rungs**, or slope and intercept cannot be separated. Five or more
+  leaves room for leave-one-out uncertainty.
+- **Several passes.** A single monotonic pass confounds LO drift with the slope.
+- **Keep `total_s` generous** so the shortest burst is comfortably longer than a
+  capture frame; `u = total_s / (N(N+1))`.
+
+## Using the ladder to measure a receiver's clock offset
+
+This is what the ladder is for. A downstream SDR can recover both its **clock
+error** and any **fixed frequency offset** in its receive chain, without being
+told which rung is which and without sharing a time base.
+
+### Why it works
+
+The synthesizer's output is derived entirely from its 125 MHz reference. A
+receiver measures that tone using its own reference. Writing δ for a
+reference's fractional error, the measured frequency of a rung comes out as
+
+```
+    f_measured  ≈  f_nominal · (1 + δ_tx − δ_rx)
+```
+
+so the fractional discrepancy is the **difference between the two references**:
+
+```
+    Δf / f_nominal  =  δ_tx − δ_rx  ≡  ε
+```
+
+If you trust the ADF5355's reference, ε is the receiver's clock error, and its
+sign tells you the direction: a tone measuring **high** means the receiver's
+clock is running **slow**.
+
+### Why a ladder rather than a single tone
+
+A single tone cannot distinguish a clock error from a constant offset. The two
+have different signatures across frequency:
+
+- a **clock error** scales with frequency — `Δf = ε · f`, a line through the origin
+- a **fixed offset** (LO/NCO/IF error, a mis-set correction) does not — `Δf = c`
+
+Measuring several rungs and fitting
+
+```
+    Δf(f)  =  ε · f  +  c
+```
+
+separates them: the **slope** is the clock error, the **intercept** is the fixed
+offset. The default ladder spans 2 GHz, which is a long lever arm — at 1 ppm the
+offset grows from 10,700 Hz at rung 1 to 12,700 Hz at rung 9, a 2,000 Hz spread
+that is trivially measurable.
+
+### Procedure
+
+1. **Capture.** Tune the SDR to each rung's nominal frequency in turn, or use a
+   span wide enough to see several. Rung 1 is the shortest burst at 0.2 s, so
+   size the capture and FFT to resolve that.
+2. **Segment and identify.** Detect burst edges — the OFF gaps make this
+   unambiguous and also give you a noise-floor reference. Divide each burst
+   length by `u` to get the rung number *n*, and hence the nominal frequency
+   `f_start + 250 MHz · (n−1)`. Round to the nearest integer; the lengths are
+   0.2 s apart, so identification is robust.
+3. **Estimate each tone.** Interpolated FFT peak, or a phase-slope estimate over
+   the burst. Longer rungs give better resolution — rung 9's 1.8 s burst gives
+   about 0.55 Hz, which at 12.7 GHz is **0.04 ppb**. Conveniently the longest
+   bursts are also the highest frequencies, where a given ε produces the largest
+   offset, so precision improves at both ends of the product.
+4. **Fit.** Compute `Δf_n = f_measured,n − f_nominal,n` and least-squares fit
+   `Δf = ε·f + c` across the rungs.
+
+### Worked example
+
+Suppose three rungs measure:
+
+| rung | nominal | measured | Δf |
+|---:|---:|---:|---:|
+| 1 | 10.700 GHz | 10.700010720 GHz | +10,720 Hz |
+| 5 | 11.700 GHz | 11.700011721 GHz | +11,721 Hz |
+| 9 | 12.700 GHz | 12.700012722 GHz | +12,722 Hz |
+
+```
+    ε = (12722 − 10720) / (12.7e9 − 10.7e9) = 2002 / 2e9 = +1.001e-6   →  +1.00 ppm
+    c = 10720 − 1.001e-6 × 10.7e9                                      →  +9 Hz
+```
+
+The receiver's reference is **1.00 ppm low**, plus a 9 Hz fixed offset in its
+chain. Had you measured only rung 5, you would have seen 11,721 Hz and been
+unable to say how much of it was which.
+
+### Applying the correction
+
+For a PlutoSDR, the reference correction is `ad9361-phy,xo_correction` (nominally
+40 MHz):
+
+```
+    xo_new = xo_current × (1 − ε)
+```
+
+Re-run the ladder afterwards and confirm the residual ε has collapsed toward
+zero — that also confirms you got the sign right, which is easier than reasoning
+about it.
+
+### Caveats
+
+- This measures the **difference** between the two references. It only gives the
+  receiver's absolute error if the ADF5355's reference is the trusted one.
+- Any real Doppler or drift folds into ε. Over a cable on a bench, both are zero.
+- Keep the path attenuated. The ladder's default range is satellite downlink
+  spectrum — see Safety.
+
+---
 
 ## Layout
 
-Everything except `device.py` is pure computation and is tested with no
-hardware attached.
+Everything except `device.py` is pure computation and is tested with no hardware
+attached.
 
 | File | Role |
 |---|---|
 | `adf5355/registers.py` | Bit positions — the single source of truth |
 | `adf5355/plan.py` | Frequency → field values (solver + register assembly) |
+| `adf5355/hopper.py` | Seeded hop schedule (SplitMix64) and runner — the contract between the two ends |
+| `adf5355/ladder.py` | Duration-coded ladder pattern and runner (superseded) |
 | `adf5355/device.py` | spidev + GPIO, write ordering, autocal, lock detect |
 | `adf5355/cli.py` | Command line front end |
-| `adf5355_ladder.py` | Standalone Ku-band duration-coded ladder (bench test) |
+| `adf5355/entry.py` | Process entry point and shutdown handling |
+| `adf5355_ladder.py` | Original standalone bench script, kept as a reference |
+| `tools/hop_decode.py` | Receive end: capture, find the comb, align the epoch, measure |
+| `tools/lever_run.py` | Drives a whole lever-arm run: visit every cluster, many times, record each capture |
+| `tools/lever_fit.py` | Combines those captures into d_rx and d_lnb separately, with resampled uncertainties |
+| `adf5355_rf_hop.sh` / `sdr_listen.sh` | The two ends of a single-cluster hop calibration, one command each |
+| `adf5355_rf_lever.sh` / `sdr_lever.sh` | The two ends of a lever-arm calibration, one command each |
 
 ### Frequency solving
 
@@ -136,23 +1260,76 @@ Two solvers are available. `adi` reproduces the reference driver exactly.
 never worse. Achieved frequency and error are reported as exact rationals, so
 the residual is real rather than a float artifact.
 
+---
+
 ## Testing
 
 ```bash
 python3 -m unittest discover -s tests -t .
 ```
 
-64 tests, no hardware required. The register images are checked three ways:
+343 tests, no hardware required — including the hop decoder, which is exercised
+against synthetic captures carrying a planted comb offset and a planted epoch,
+and the whole lever arm, which is exercised against synthetic multi-cluster runs
+carrying a planted d_rx and d_lnb. The register images are checked three ways:
 
 1. **`tests/test_registers.py`** — the bitfield table itself: no field overlaps
    another, collides with reserved bits, or corrupts the address nibble.
 2. **`tests/test_vs_adi_c.py`** — a differential test against
    `tests/adi_reference.c`, a verbatim transcription of the arithmetic in
-   Analog Devices' no-OS driver, compiled on demand and compared field by
-   field across a grid of references, frequencies and charge-pump settings.
-3. **`tests/test_ladder_parity.py`** — the package must reproduce
-   `adf5355_ladder.py`'s register images exactly. That script has been used on
-   the bench, so it counts as a third independent implementation.
+   Analog Devices' no-OS driver, compiled on demand and compared field by field
+   across a grid of references, frequencies and charge-pump settings.
+3. **`tests/test_ladder_parity.py`** and **`tests/test_ladder_package_parity.py`** —
+   the package must reproduce `adf5355_ladder.py`'s register images and ladder
+   schedules exactly. That script has been used on the bench, so it counts as a
+   third independent implementation.
+
+Two more guard the calibration rather than the registers:
+
+4. **`tests/test_hop_decode.py`** — synthesises the capture a perfect receiver
+   would have taken, then asserts the decoder recovers the planted offset to
+   within **one hertz at every point**, the planted epoch to within a frame,
+   and every point; and that a wrong seed or pure noise is reported as
+   untrustworthy rather than measured.
+
+   The estimator is held to its own account there. The old estimator's floor is
+   shown to be *bias* by measuring it with no noise present at all, and shown to
+   be unmovable by measuring the same tone from frames at different phases and
+   asserting the answer agrees to six decimals. The new one is asserted to reach
+   the Cramér–Rao bound — within 25% of it, and a test fails if it ever comes in
+   *below* the bound, because that means a bug rather than a triumph — and to
+   beat the old one by more than a hundredfold on byte-identical input. The
+   synthesiser models what the hardware does rather than what would be
+   convenient: independent phase per visit by default, because a PLL that
+   retunes away relocks with no memory of its phase, with the coherent
+   alternative available so that the technique it would unlock can be shown
+   working and then shown unavailable.
+5. **`tests/test_script_defaults.py`** — parses `adf5355_rf_hop.sh` and
+   `sdr_listen.sh` and asserts every shared setting matches, that each is
+   actually passed through to the tool it drives, and that both agree with the
+   package defaults. Drift between the two ends is the failure the whole design
+   guards against, so it is checked mechanically rather than by eye.
+6. **`tests/test_lever_arm.py`** — the whole multi-cluster measurement, at two
+   levels. The complete chain (synthesised I/Q → cluster decoder → fit) is run
+   on a small but complete four-cluster, six-sweep run and asserted to return
+   **both** d_rx and d_lnb, with and without LNB drift and with and without a
+   per-capture tuning bias. The fit alone is then hammered on runs synthesised
+   directly as records, where a hundred captures cost a millisecond and every
+   error source can be injected one at a time.
+
+   The failures that get asserted are the *silent* ones. A per-cluster offset
+   must trip the linearity check; a tilted within-capture slope must trip the
+   two-lever comparison; a tuning bias that varies smoothly with tuning must
+   trip the variogram; a clock that moves halfway through must trip the
+   split-half. A covariance built on the decoder's own standard errors is
+   asserted to understate the answer's uncertainty by more than tenfold, which
+   is why the resample exists. The bootstrap interval's coverage is measured
+   rather than assumed. And the schedule itself is checked: every (cluster,
+   point) once per cycle, band changes only at block boundaries, every cluster
+   in every round, the points a Golomb ruler with distinct differences, and a
+   fake device that records which hops got a VCO band search and which did not.
+   `adf5355_rf_lever.sh` and `sdr_lever.sh` are parsed and cross-checked the
+   same way the single-cluster pair are, safety banners included.
 
 ### Known defects in the Analog Devices reference
 
@@ -164,45 +1341,37 @@ bugs. Each is corrected here and marked `DIVERGENCE` in `plan.py`.
    divide-by-zero in the sigma-delta modulator. Reachable when f_PFD is
    `16384 × 2^k` and the reduced FRAC2 is odd, e.g. f_PFD = 67.108864 MHz.
 
-2. **R7 is always wrong.** The driver builds it as
-   `a | b | … | cond ? X : Y`. `?:` binds looser than `|`, so the whole left
-   side becomes the condition, which is always truthy — the driver emits the
-   ADF5356 default `0x04000007` for every part, including the ADF5355. The
-   correct ADF5355 value is `0x12000067`.
+2. **R7 is always wrong.** The driver builds it as `a | b | … | cond ? X : Y`.
+   `?:` binds looser than `|`, so the whole left side becomes the condition,
+   which is always truthy — the driver emits the ADF5356 default `0x04000007`
+   for every part, including the ADF5355. The correct value is `0x12000067`.
 
 3. **The ADC clock divider can exceed its limit.** The driver computes
    `DIV_ROUND_UP(fpfd / 100000U - 2, 4)`; the inner integer division truncates
    before the ceiling and can round the divider down by one. At f_PFD =
    61.44 MHz (a 122.88 MHz reference, common on clone boards) that gives
    `adc_div = 153` and a 100,065 Hz ADC clock, over the datasheet's 100 kHz
-   ceiling for VCO band select. Solving the inequality directly in integers
-   avoids the lost remainder.
+   ceiling for VCO band select.
+
+---
 
 ## Safety
 
-`adf5355_ladder.py` defaults to a 9-rung 10.7–12.7 GHz ladder, which overlaps
-satellite downlink allocations. Use a closed, shielded, attenuated path. Do not
-radiate. RF is never enabled without `--enable-rf`; `--dry-run` computes the
-schedule and the first register image and touches no hardware.
+**These are theoretical bench tests and must never be performed over open air.**
 
-The range is selectable, but the defaults are pinned to the pattern documented
-in `raspberry_pi_adf5355_ku_ladder_guide.pdf`, so a run with no range arguments
-is byte-for-byte the same ladder as before.
+The default hop sits at 11.0 GHz and the default ladder sweeps 10.7–12.7 GHz,
+both of which overlap satellite downlink allocations. Transmitting there terrestrially is prohibited in essentially every
+jurisdiction, requires a licence you almost certainly do not hold, and can
+interfere with satellite reception far outside your own site.
 
-```bash
-python3 adf5355_ladder.py --dry-run
-python3 adf5355_ladder.py --start-ghz 8.0 --stop-ghz 9.0 \
-                          --steps 5 --total-s 6 --dry-run
-```
+Every procedure in this repository assumes a **closed, conducted path**: coax
+from the synthesiser into an attenuator and a load, or into a shielded
+enclosure. **Do not connect an antenna. Do not radiate.** If you cannot
+guarantee the path is closed, do not pass `--enable-rf`.
 
-| Option | Default | Meaning |
-|---|---|---|
-| `--start-ghz` | 10.7 | First rung in GHz; must sit inside RFOUTB's 6.8–13.6 GHz |
-| `--stop-ghz` | 12.7 | Last rung in GHz; must be in band and not below `--start-ghz` |
-| `--steps` | 9 | Number of rungs (2 or more); spacing is span/(steps−1) |
-| `--total-s` | 18.0 | Coded interval; rung n is ON=n·u then OFF=n·u, u = total/(N(N+1)) |
+`dump`, `probe` and any `--dry-run` invocation never key the output, so the
+register work and the arithmetic can all be exercised with no RF at all.
 
-The whole range is checked before anything is programmed, so an out-of-band,
-inverted or degenerate request fails with a message and exit status 2 instead of
-partway through a live sweep. The printed summary reports what was derived from
-the range: bin count, spacing, the unit time u and the total coded interval.
+`--power` defaults to the lowest step, but +5 dBm is available and will damage a
+PlutoSDR front end (limit around +2.5 dBm). Pad the path 20–30 dB before
+connecting a receiver.

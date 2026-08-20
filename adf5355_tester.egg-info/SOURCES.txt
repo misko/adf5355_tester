@@ -6,6 +6,7 @@ adf5355/__main__.py
 adf5355/cli.py
 adf5355/device.py
 adf5355/entry.py
+adf5355/hopper.py
 adf5355/ladder.py
 adf5355/plan.py
 adf5355/registers.py
@@ -16,9 +17,16 @@ adf5355_tester.egg-info/entry_points.txt
 adf5355_tester.egg-info/requires.txt
 adf5355_tester.egg-info/top_level.txt
 tests/test_cli_defaults.py
+tests/test_driver_parity.py
+tests/test_fast_ladder.py
+tests/test_hop_decode.py
+tests/test_hopper.py
 tests/test_ladder_package_parity.py
 tests/test_ladder_parity.py
 tests/test_ladder_range.py
+tests/test_lever_arm.py
+tests/test_mute_persistence.py
 tests/test_plan.py
 tests/test_registers.py
+tests/test_script_defaults.py
 tests/test_vs_adi_c.py

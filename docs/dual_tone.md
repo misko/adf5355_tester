@@ -553,6 +553,63 @@ the whole procedure down each in turn, 120 s of drift on each:
 
 Both are low band, both identified with better than 42 dB of margin.
 
+### What the points actually do
+
+The fitted slopes hide the interesting part. Point by point, each measurement
+against its own run mean:
+
+![Two LNBs, 120 s each](dual_tone_two_lnbs.png)
+
+```
+  RX0  (LNB #1)   parked at 1550.022 MHz, nominal IF 1550.000 MHz
+    #    t (s)     measured IF (Hz)    offset (Hz)   d from 1st     SNR
+    0      0.7      1,550,322,301.4      322,301.4         +0.0   61.5dB
+    1     17.6      1,550,322,443.7      322,443.7       +142.2   61.0dB
+    2     27.6      1,550,322,499.8      322,499.8       +198.3   63.3dB
+    3     37.6      1,550,322,338.6      322,338.6        +37.1   59.3dB
+    4     47.6      1,550,322,438.7      322,438.7       +137.3   63.3dB
+    5     57.6      1,550,322,366.0      322,366.0        +64.6   62.6dB
+    6     67.6      1,550,322,433.7      322,433.7       +132.2   59.9dB
+    7     77.6      1,550,322,369.9      322,369.9        +68.4   60.6dB
+    8     87.6      1,550,322,460.7      322,460.7       +159.3   60.2dB
+    9     95.6      1,550,322,496.6      322,496.6       +195.1   64.9dB
+   10    105.6      1,550,322,253.7      322,253.7        -47.7   63.8dB
+   11    115.6      1,550,322,134.8      322,134.8       -166.7   62.3dB
+
+  RX1  (LNB #2)   parked at 1549.409 MHz, nominal IF 1550.000 MHz
+    #    t (s)     measured IF (Hz)    offset (Hz)   d from 1st     SNR
+    0      2.3      1,549,709,769.9     -290,230.1         +0.0   61.8dB
+    1     17.1      1,549,709,712.1     -290,287.9        -57.9   60.8dB
+    2     27.1      1,549,709,756.5     -290,243.5        -13.5   62.4dB
+    3     37.1      1,549,709,752.4     -290,247.6        -17.5   61.8dB
+    4     47.1      1,549,709,569.8     -290,430.2       -200.2   60.6dB
+    5     57.1      1,549,709,771.9     -290,228.1         +2.0   61.2dB
+    6     65.1      1,549,709,979.1     -290,020.9       +209.2   63.0dB
+    7     77.1      1,549,709,735.3     -290,264.7        -34.6   61.7dB
+    8     85.1      1,549,709,915.4     -290,084.6       +145.5   61.8dB
+    9     95.1      1,549,709,877.8     -290,122.2       +107.9   63.5dB
+   10    103.1      1,549,709,870.6     -290,129.4       +100.6   61.9dB
+   11    113.1      1,549,709,741.5     -290,258.5        -28.4   62.1dB
+```
+
+**Neither series is a ramp.** RX0 climbs +198 Hz by 28 s, drops back to +37 at
+38 s, returns to +195 at 96 s, then falls to −167 by 116 s. RX1 does the same in
+a different pattern — −200 Hz at 47 s to +209 Hz at 65 s, a 409 Hz swing in
+eighteen seconds. The points leave the ±1 rms band and come back, which is what
+distinguishes a wandering oscillator from noise around a line.
+
+**The scatter is not the estimator.** Fine bins are 1.19 Hz throughout and SNR
+never leaves 59–65 dB, so a single tone estimate is good to well under a hertz.
+The ~96 Hz residual rms is about 100× that. It is the oscillator plus the
+receiver's tuning bias, not the frequency measurement.
+
+Both channels land at almost the same residual scatter — 97.8 against 95.3 Hz —
+despite their LOs being 613 kHz apart, which is what a shared receiver-side
+contribution would look like.
+
+The figure is regenerated from the recorded runs with
+`tools/plot_drift_pair.py rx0.jsonl rx1.jsonl --out pair.png`.
+
 **The differential is the strongest number here.** Both LNBs see the same
 transmitted tone through the same receiver, so the ADF5355's reference error and
 the Pluto's clock error are common mode and cancel exactly in the difference.
@@ -630,4 +687,5 @@ one number.
 | `tools/emit_ladder_plan.py` | Emits the two-point plan the C transmitter consumes |
 | `tools/dwell_ladder.c` | Alternates the two tones, one period in memory, loops forever |
 | `tools/lnb_band_id.py` | Decides the band, measures the offset over four dithers, and with `--monitor-s` fits and plots the drift. `--rx-channel` selects the LNB; `--monitor-only-ghz` skips the band test for a path with no LNB in it |
+| `tools/plot_drift_pair.py` | Plots two drift runs against their own means, so LNBs 613 kHz apart are comparable |
 | `tools/adf_off.c` / `adf off` | Puts the outputs down afterwards |
